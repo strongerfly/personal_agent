@@ -1,0 +1,10 @@
+{
+  "name": "personal-court-os",
+  "version": "0.1.0",
+  "private": true,
+  "description": "个人朝廷 OS 本地可运行系统",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  }
+}
