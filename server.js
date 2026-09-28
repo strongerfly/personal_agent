@@ -7,6 +7,14 @@ const { createIntegrations, validateSettings } = require('./lib/integrations');
 const DAY = 86400000;
 const ZONE = 8 * 3600000;
 const DEMOS = ['补齐客户方案的成本测算页', '完成数据分析练习：分组对比', '把会议纪要转成三个行动项', '整理本周视频引用与时间码', '复盘两个顺延任务的估时偏差', '清理一个重复的自动化提醒'];
+const DEPARTMENTS = [
+  { id: '吏部', name: '吏部', role: '成长与能力', description: '以目标串联刻意练习，积累能力与成长证据。', page: 'actions' },
+  { id: '户部', name: '户部', role: '时间与精力', description: '安排时间投入，记录精力，调整个人资源分配。', page: 'today' },
+  { id: '礼部', name: '礼部', role: '学习与表达', description: '把阅读、回忆与表达练习转化为可用的知识。', page: 'learning' },
+  { id: '兵部', name: '兵部', role: '项目与执行', description: '推进项目和交付，明确下一步，完成真实承诺。', page: 'actions' },
+  { id: '刑部', name: '刑部', role: '问题与复盘', description: '记录阻碍、核对证据，从复盘中形成改进。', page: 'review' },
+  { id: '工部', name: '工部', role: '工具与运行', description: '维护自动整理、知识库与模型连接，减少重复劳动。', page: 'connections' }
+];
 const id = () => crypto.randomUUID();
 const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
 const dayKey = date => new Date(+new Date(date) + ZONE).toISOString().slice(0, 10);
@@ -30,9 +38,22 @@ function taskStatus(value) {
   if (!['待确认', '执行中', '已完成', '已顺延'].includes(status)) throw fail('任务状态无效');
   return status;
 }
+function department(value) {
+  if (!DEPARTMENTS.some(item => item.id === value)) throw fail('负责部门必须为吏部、户部、礼部、兵部、刑部或工部');
+  return value;
+}
+function effort(value = 25) {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) throw fail('预计时间需在 1–1440 分钟之间');
+  return minutes;
+}
+function priorityValue(value = '中') {
+  if (!['高', '中', '低'].includes(value)) throw fail('优先级必须为高、中或低');
+  return value;
+}
 function freshStore() {
   return {
-    schemaVersion: 3, tasks: [], petitions: [], reading: [], digests: [], goals: [], checkins: [], runs: [], events: [], aiAnalyses: [],
+    schemaVersion: 4, tasks: [], petitions: [], reading: [], digests: [], goals: [], checkins: [], runs: [], events: [], aiAnalyses: [], proposals: [],
     settings: { vaultPath: '', readingFolder: 'WeRead', ai: { enabled: false, baseUrl: '', model: '' } },
     automation: { enabled: false, dailyHour: 21, weeklyDay: 0, weeklyHour: 21, autoImport: false, timezone: 'Asia/Shanghai', lastDailyRunDate: null, lastWeeklyRunDate: null },
     integrations: { obsidian: { lastExportAt: null, lastExportFiles: [] } }
@@ -41,10 +62,10 @@ function freshStore() {
 function migrate(parsed) {
   if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw fail('数据文件结构无效，原文件已保留', 500);
   const base = freshStore();
-  for (const key of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'runs', 'events', 'aiAnalyses']) {
+  for (const key of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'runs', 'events', 'aiAnalyses', 'proposals']) {
     if (parsed[key] !== undefined && !Array.isArray(parsed[key])) throw fail(`数据字段 ${key} 无效，原文件已保留`, 500);
   }
-  const result = { ...base, ...parsed, schemaVersion: 3 };
+  const result = { ...base, ...parsed, schemaVersion: 4 };
   result.settings = { ...base.settings, ...parsed.settings, ai: { ...base.settings.ai, ...parsed.settings?.ai } };
   result.automation = { ...base.automation, ...parsed.automation, timezone: 'Asia/Shanghai' };
   result.integrations = { ...base.integrations, ...parsed.integrations };
@@ -113,11 +134,63 @@ function createApp(options = {}) {
     }
     const goalId = text(body.goalId);
     if (goalId) lookup(draft, 'goals', goalId);
-    const minutes = body.minutes === undefined || body.minutes === '' ? 25 : Number(body.minutes);
-    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) throw fail('预计时间需在 1–1440 分钟之间');
-    const priority = ['高', '中', '低'].includes(body.priority) ? body.priority : '中';
-    const task = { id: id(), title: required(body.title, '行动标题'), dept: text(body.dept, 30) || '兵部', priority, status: '待确认', goalId, dueAt: dateValue(body.dueAt), minutes, evidence: '', createdAt: stamp(), updatedAt: stamp(), ...source };
+    const minutes = effort(body.minutes === '' ? undefined : body.minutes);
+    const priority = priorityValue(body.priority);
+    const task = { id: id(), title: required(body.title, '行动标题'), dept: department(body.dept || '兵部'), priority, status: '待确认', goalId, dueAt: dateValue(body.dueAt), minutes, evidence: '', createdAt: stamp(), updatedAt: stamp(), ...source };
     draft.tasks.push(task); event(draft, 'task.created', task.id); return task;
+  }
+  function courtOverview() {
+    const realTasks = store.tasks.filter(task => !task.isDemo);
+    const count = status => store.proposals.filter(proposal => proposal.status === status).length;
+    const stats = { drafts: count('draft'), review: count('review'), returned: count('returned'), approved: count('approved'), executing: count('executing'), completed: count('completed') };
+    const departments = DEPARTMENTS.map(meta => {
+      const assigned = realTasks.filter(task => task.dept === meta.id), active = assigned.filter(task => !done(task));
+      return { ...meta, active: active.length, completed: assigned.filter(done).length, estimatedMinutes: active.reduce((sum, task) => sum + (Number(task.minutes) || 0), 0), overdue: active.filter(task => task.dueAt && Date.parse(task.dueAt) < +now()).length, goalCount: new Set(assigned.map(task => task.goalId).filter(Boolean)).size };
+    });
+    return {
+      provinces: [
+        { id: 'zhongshu', name: '中书省', role: '拟定计划', description: '明确目标、分解步骤、写清验收标准。', pending: stats.drafts + stats.returned },
+        { id: 'menxia', name: '门下省', role: '审议把关', description: '核对方向与投入，批准计划或说明理由退回。', pending: stats.review },
+        { id: 'shangshu', name: '尚书省', role: '执行与验收', description: '将已批准计划派发六部，以完成证据验收归档。', pending: stats.approved + stats.executing }
+      ], departments, stats,
+      unassignedCount: realTasks.filter(task => !DEPARTMENTS.some(dept => dept.id === task.dept)).length,
+      awaitingAcceptance: store.proposals.filter(proposal => proposal.status === 'executing' && proposal.taskIds.length && proposal.taskIds.every(taskId => realTasks.some(task => task.id === taskId && done(task) && text(task.evidence)))).length
+    };
+  }
+  function proposalFields(draft, body, existing = null) {
+    const field = (key, fallback) => body[key] === undefined ? (existing?.[key] ?? fallback) : body[key];
+    const goalId = text(field('goalId', ''));
+    if (goalId) lookup(draft, 'goals', goalId);
+    const inputSteps = field('steps', []);
+    if (!Array.isArray(inputSteps) || inputSteps.length > 8) throw fail('每份计划最多包含 8 个步骤');
+    const previousIds = new Set((existing?.steps || []).map(step => step.id)), usedIds = new Set();
+    const steps = inputSteps.map(step => {
+      if (!step || typeof step !== 'object' || Array.isArray(step)) throw fail('步骤格式无效');
+      if (step.id && !previousIds.has(step.id)) throw fail('步骤 ID 不属于当前计划');
+      const stepId = step.id || id();
+      if (usedIds.has(stepId)) throw fail('步骤 ID 不能重复');
+      usedIds.add(stepId);
+      return { id: stepId, title: text(step.title, 300), acceptance: text(step.acceptance, 2000), minutes: effort(step.minutes) };
+    });
+    return { title: required(field('title', ''), '计划标题'), intent: text(field('intent', ''), 4000), dept: department(field('dept', '兵部')), goalId, priority: priorityValue(field('priority', '中')), steps };
+  }
+  function courtHistory(draft, proposal, stage, action, note = '') {
+    proposal.updatedAt = stamp();
+    proposal.history.push({ id: id(), stage, action, note: text(note, 4000), revision: proposal.revision, createdAt: stamp() });
+    event(draft, `court.${action}`, proposal.id, stage);
+  }
+  function assertRevision(proposal, revision) {
+    if (!Number.isInteger(revision) || revision < 1) throw fail('请提供有效的公文版本 revision');
+    if (proposal.revision !== revision) throw fail('公文版本已更新，请刷新后重新查看与操作', 409);
+  }
+  function assertPlanComplete(proposal) {
+    required(proposal.intent, '拟案目的', 4000);
+    if (!proposal.steps.length) throw fail('请至少添加一个行动步骤');
+    proposal.steps.forEach((step, index) => {
+      required(step.title, `第 ${index + 1} 步的行动内容`);
+      required(step.acceptance, `第 ${index + 1} 步的验收标准`, 2000);
+      effort(step.minutes);
+    });
   }
   function parseReading(body) {
     if (Array.isArray(body.items)) return body.items;
@@ -278,19 +351,90 @@ function createApp(options = {}) {
       if (req.headers['sec-fetch-site'] === 'cross-site') throw fail('不允许跨站写入', 403);
     }
     const body = write ? await readBody(req) : {};
-    if (method === 'GET' && route === '/api/health') return { ok: true, version: '0.2.0', schemaVersion: 3, timezone: 'Asia/Shanghai' };
-    if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), integrations: integrations.status() };
+    if (method === 'GET' && route === '/api/health') return { ok: true, version: '0.3.0', schemaVersion: 4, timezone: 'Asia/Shanghai' };
+    if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), court: courtOverview(), integrations: integrations.status() };
+    if (method === 'GET' && route === '/api/court') return courtOverview();
     if (method === 'GET' && route === '/api/overview') return overview();
     if (method === 'GET' && route === '/api/morning') return morning();
     if (method === 'GET' && route === '/api/export') { res.setHeader('Content-Disposition', 'attachment; filename="personal-court-backup.json"'); return store; }
     for (const list of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'events', 'runs']) {
       if (method === 'GET' && route === `/api/${list}`) return store[list].filter(item => !url.searchParams.get('dept') || item.dept === url.searchParams.get('dept')).filter(item => !url.searchParams.get('status') || item.status === url.searchParams.get('status'));
     }
+    if (method === 'GET' && route === '/api/court/proposals') return store.proposals;
+    if (method === 'POST' && route === '/api/court/proposals') return { proposal: mutate(draft => {
+      const proposal = { id: id(), ...proposalFields(draft, body), status: 'draft', revision: 1, taskIds: [], history: [], createdAt: stamp(), updatedAt: stamp() };
+      draft.proposals.unshift(proposal);
+      courtHistory(draft, proposal, '中书省', 'drafted', '拟定计划草案');
+      return proposal;
+    }) };
+    let match = route.match(/^\/api\/court\/proposals\/([^/]+)(?:\/(submit|review|dispatch|accept))?$/);
+    if (match) {
+      const proposalId = match[1], action = match[2];
+      if (method === 'GET' && !action) return { proposal: lookup(store, 'proposals', proposalId) };
+      if (method === 'PATCH' && !action) return { proposal: mutate(draft => {
+        const proposal = lookup(draft, 'proposals', proposalId);
+        assertRevision(proposal, body.revision);
+        if (!['draft', 'returned'].includes(proposal.status)) throw fail('只能修改草案或已退回的计划；已批准内容已冻结', 409);
+        Object.assign(proposal, proposalFields(draft, body, proposal));
+        proposal.revision++;
+        courtHistory(draft, proposal, '中书省', 'edited', '修改计划内容，等待重新提交');
+        return proposal;
+      }) };
+      if (method === 'POST' && action) {
+        const current = lookup(store, 'proposals', proposalId);
+        // A retry after a lost response returns the exact prior dispatch, without a second write.
+        if (action === 'dispatch' && ['executing', 'completed'].includes(current.status)) return { proposal: current, tasks: current.taskIds.map(taskId => lookup(store, 'tasks', taskId)) };
+        return mutate(draft => {
+          const proposal = lookup(draft, 'proposals', proposalId);
+          assertRevision(proposal, body.revision);
+          if (action === 'submit') {
+            if (!['draft', 'returned'].includes(proposal.status)) throw fail('只有草案或退回的计划可以提请审议', 409);
+            assertPlanComplete(proposal);
+            proposal.status = 'review'; proposal.revision++;
+            courtHistory(draft, proposal, '中书省', 'submitted', '提请门下省审议');
+          } else if (action === 'review') {
+            if (proposal.status !== 'review') throw fail('此计划不在待审议状态', 409);
+            if (!['approve', 'return'].includes(body.decision)) throw fail('请选择批准或退回');
+            const note = body.decision === 'return' ? required(body.note, '退回原因', 4000) : text(body.note, 4000) || '已核对方向、步骤、投入与验收标准';
+            assertPlanComplete(proposal);
+            proposal.status = body.decision === 'approve' ? 'approved' : 'returned'; proposal.revision++;
+            proposal.review = { decision: body.decision, note, revision: proposal.revision, createdAt: stamp() };
+            courtHistory(draft, proposal, '门下省', body.decision === 'approve' ? 'approved' : 'returned', note);
+          } else if (action === 'dispatch') {
+            if (proposal.status !== 'approved') throw fail('计划需经门下省批准后才能派发', 409);
+            assertPlanComplete(proposal);
+            const tasks = proposal.steps.map(step => newTask(draft, { title: step.title, dept: proposal.dept, goalId: proposal.goalId, priority: proposal.priority, minutes: step.minutes }, { sourceType: 'proposal', sourceId: `${proposal.id}:${step.id}`, proposalId: proposal.id, proposalStepId: step.id, acceptance: step.acceptance }));
+            proposal.taskIds = tasks.map(task => task.id);
+            proposal.status = 'executing'; proposal.revision++; proposal.dispatchedAt = stamp();
+            courtHistory(draft, proposal, '尚书省', 'dispatched', `派发 ${tasks.length} 项行动至${proposal.dept}`);
+            return { proposal, tasks };
+          } else if (action === 'accept') {
+            if (proposal.status !== 'executing') throw fail('只有执行中的计划可以验收', 409);
+            const tasks = proposal.taskIds.map(taskId => lookup(draft, 'tasks', taskId));
+            if (!tasks.length || tasks.length !== proposal.steps.length || tasks.some(task => task.proposalId !== proposal.id || !done(task) || !text(task.evidence))) throw fail('所有派发行动都需完成并提供证据，才能验收归档', 409);
+            const note = required(body.note, '验收意见', 4000);
+            proposal.status = 'completed'; proposal.revision++; proposal.acceptedAt = stamp();
+            proposal.acceptance = { note, createdAt: stamp(), evidence: tasks.map(task => ({ taskId: task.id, title: task.title, acceptance: task.acceptance, evidence: task.evidence, completedAt: task.completedAt })) };
+            courtHistory(draft, proposal, '尚书省', 'accepted', note);
+          }
+          return { proposal };
+        });
+      }
+    }
     if (method === 'POST' && route === '/api/tasks') return { task: mutate(draft => newTask(draft, body)) };
-    let match = route.match(/^\/api\/tasks\/([^/]+)$/);
+    match = route.match(/^\/api\/tasks\/([^/]+)$/);
     if (method === 'PATCH' && match) return { task: mutate(draft => {
       const task = lookup(draft, 'tasks', match[1]);
+      const beforeStatus = task.status, beforeEvidence = task.evidence;
+      if (task.proposalId) {
+        const proposal = lookup(draft, 'proposals', task.proposalId);
+        if (proposal.status === 'completed') throw fail('计划已验收，行动与证据已归档，不可继续修改', 409);
+        if (Object.keys(body).some(field => !['status', 'evidence'].includes(field))) throw fail('派发行动的计划内容已锁定，只能更新执行状态和完成证据', 409);
+      }
       if (body.title !== undefined) task.title = required(body.title, '行动标题');
+      if (body.dept !== undefined) task.dept = department(body.dept);
+      if (body.priority !== undefined) task.priority = priorityValue(body.priority);
+      if (body.minutes !== undefined) task.minutes = effort(body.minutes);
       if (body.evidence !== undefined) task.evidence = text(body.evidence, 4000);
       if (done(task) && body.status === undefined && !text(task.evidence)) throw fail('已完成行动需要保留完成证据');
       if (body.dueAt !== undefined) task.dueAt = dateValue(body.dueAt);
@@ -302,7 +446,13 @@ function createApp(options = {}) {
         if (status !== '已完成') task.completedAt = null;
         task.status = status;
       }
-      task.updatedAt = stamp(); return task;
+      task.updatedAt = stamp();
+      if (task.proposalId && (beforeStatus !== task.status || beforeEvidence !== task.evidence)) {
+        const proposal = lookup(draft, 'proposals', task.proposalId);
+        proposal.revision++;
+        courtHistory(draft, proposal, task.dept, 'progress', `${task.title}：${task.status}${beforeEvidence !== task.evidence ? '，完成证据已更新' : ''}`);
+      }
+      return task;
     }) };
     if (method === 'POST' && route === '/api/goals') return { goal: mutate(draft => {
       const goal = { id: id(), title: required(body.title, '目标'), why: text(body.why), targetDate: dateValue(body.targetDate), status: 'active', createdAt: stamp() };
@@ -334,7 +484,7 @@ function createApp(options = {}) {
     match = route.match(/^\/api\/reading\/([^/]+)\/(review|task)$/);
     if (method === 'POST' && match) return mutate(draft => {
       const item = lookup(draft, 'reading', match[1]);
-      if (match[2] === 'task') return { task: newTask(draft, { title: body.title || `应用《${item.title}》中的一个观点` }, { sourceType: 'reading', sourceId: item.id }) };
+      if (match[2] === 'task') return { task: newTask(draft, { title: body.title || `应用《${item.title}》中的一个观点`, dept: '礼部' }, { sourceType: 'reading', sourceId: item.id }) };
       if (!['again', 'good'].includes(body.rating)) throw fail('复习反馈应为 again 或 good');
       const answer = required(body.answer, '自己的回忆内容或遗忘之处', 4000);
       const steps = [1, 3, 7, 14, 30], step = body.rating === 'again' ? 0 : Math.min(item.reviewStep || 0, steps.length - 1);

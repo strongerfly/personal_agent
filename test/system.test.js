@@ -91,10 +91,11 @@ test('fresh API has empty real data, a working health endpoint, and no destructi
   const f = await fixture(t);
   const health = await ok(f, 'GET', '/api/health');
   assert.equal(health.ok, true);
-  assert.equal(health.schemaVersion, 3);
+  assert.equal(health.schemaVersion, 4);
+  assert.match(health.version, /^0\.3\./);
   assert.equal(health.timezone, 'Asia/Shanghai');
   const state = await ok(f, 'GET', '/api/state');
-  for (const list of ['tasks', 'goals', 'reading', 'petitions', 'digests', 'checkins', 'runs']) assert.deepEqual(state[list], []);
+  for (const list of ['tasks', 'goals', 'reading', 'petitions', 'digests', 'checkins', 'runs', 'proposals']) assert.deepEqual(state[list], []);
   assert.equal(state.overview.activeTasks, 0);
   assert.equal(state.overview.completionRate, null);
   assert.deepEqual((await ok(f, 'GET', '/api/morning')).tasks, []);
@@ -438,4 +439,275 @@ test('AI endpoints preview disclosure, require approval, and reject invented ref
   assert.equal((await f.request('POST', '/api/ai/run', { question: '下一步做什么？', previewId: secondPreview.previewId, approved: true })).status, 502);
   assert.equal((await ok(f, 'GET', '/api/state')).aiAnalyses.length, 1, 'Rejected AI output must not be recorded as a successful analysis');
   assert.equal((await ok(f, 'GET', '/api/tasks')).length, 1, 'AI suggestions must not execute or create tasks');
+});
+
+function proposalBody(overrides = {}) {
+  return {
+    title: '让每一份计划形成可验收成果',
+    intent: '减少只记录不执行的计划，保留真实完成证据',
+    dept: '工部', priority: '高',
+    steps: [
+      { title: '实现一个可验证步骤', minutes: 25, acceptance: '提供实际运行结果' },
+      { title: '记录验证过程', minutes: 15, acceptance: '写明输入、结果和局限' }
+    ],
+    ...overrides
+  };
+}
+
+async function courtProposal(f, overrides = {}) {
+  return (await ok(f, 'POST', '/api/court/proposals', proposalBody(overrides))).proposal;
+}
+
+async function courtTransition(f, proposal, action, body = {}) {
+  return ok(f, 'POST', `/api/court/proposals/${proposal.id}/${action}`, { revision: proposal.revision, ...body });
+}
+
+async function courtApproved(f, overrides = {}) {
+  let proposal = await courtProposal(f, overrides);
+  proposal = (await courtTransition(f, proposal, 'submit')).proposal;
+  return (await courtTransition(f, proposal, 'review', { decision: 'approve', note: '计划有明确目的与验收条件' })).proposal;
+}
+
+async function rejectedUnchanged(f, method, route, body, expected = [400, 409]) {
+  const before = await ok(f, 'GET', '/api/export');
+  const response = await f.request(method, route, body);
+  const allowed = Array.isArray(expected) ? expected : [expected];
+  assert(allowed.includes(response.status), `${method} ${route}: expected ${allowed.join('/')}, got ${response.status}: ${JSON.stringify(response.body)}`);
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), before, 'Rejected court mutation must not change records, revisions, or events');
+  return response;
+}
+
+test('court lifecycle links real tasks, enforces evidence, and freezes accepted work', async t => {
+  const f = await fixture(t);
+  const { goal } = await ok(f, 'POST', '/api/goals', { title: '有验收证据的个人工作闭环' });
+  let proposal = await courtProposal(f, { goalId: goal.id });
+  assert.equal(proposal.status, 'draft');
+  assert.equal(proposal.revision, 1);
+  assert.equal(proposal.steps.length, 2);
+  assert(proposal.steps.every(step => typeof step.id === 'string' && step.id));
+  assert.equal(new Set(proposal.steps.map(step => step.id)).size, 2);
+  const initialStepIds = proposal.steps.map(step => step.id);
+  proposal = (await courtTransition(f, proposal, 'submit')).proposal;
+  assert.equal(proposal.status, 'review');
+  assert.equal(proposal.revision, 2);
+  proposal = (await courtTransition(f, proposal, 'review', { decision: 'approve' })).proposal;
+  assert.equal(proposal.status, 'approved');
+  assert.equal(proposal.revision, 3);
+  const dispatched = await courtTransition(f, proposal, 'dispatch');
+  proposal = dispatched.proposal;
+  assert.equal(proposal.status, 'executing');
+  assert.equal(proposal.revision, 4);
+  assert.equal(dispatched.tasks.length, 2);
+  assert.deepEqual(proposal.steps.map(step => step.id), initialStepIds);
+  for (let index = 0; index < dispatched.tasks.length; index++) {
+    const task = dispatched.tasks[index];
+    assert.equal(task.proposalId, proposal.id);
+    assert.equal(task.acceptance, proposal.steps[index].acceptance);
+    assert.equal(task.dept, '工部');
+    assert.equal(task.goalId, goal.id);
+    assert.equal(task.sourceType, 'proposal');
+    assert.equal(task.sourceId, `${proposal.id}:${proposal.steps[index].id}`);
+  }
+  const first = dispatched.tasks[0];
+  for (const patch of [{ title: '绕过审批改标题' }, { dept: '吏部' }, { priority: '低' }, { minutes: 60 }, { goalId: '' }, { dueAt: '2026-12-01T00:00:00Z' }]) {
+    await rejectedUnchanged(f, 'PATCH', `/api/tasks/${first.id}`, patch);
+  }
+  await rejectedUnchanged(f, 'PATCH', `/api/tasks/${first.id}`, { status: 'done' }, 400);
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/accept`, { revision: proposal.revision, note: '不能验收尚未完成的步骤' });
+  for (const task of dispatched.tasks) await ok(f, 'PATCH', `/api/tasks/${task.id}`, { status: 'done', evidence: `${task.title}：已记录实际运行结果与验证步骤` });
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/accept`, { revision: proposal.revision, note: '证据已变化，旧版不得验收' }, 409);
+  proposal = (await ok(f, 'GET', `/api/court/proposals/${proposal.id}`)).proposal;
+  assert(proposal.revision > 4, 'Actual task progress must invalidate an earlier acceptance revision');
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/accept`, { revision: proposal.revision, note: '   ' }, 400);
+  const acceptanceRevision = proposal.revision;
+  proposal = (await courtTransition(f, proposal, 'accept', { note: '逐项核对证据，完成本轮验收' })).proposal;
+  assert.equal(proposal.status, 'completed');
+  assert.equal(proposal.revision, acceptanceRevision + 1);
+  await rejectedUnchanged(f, 'PATCH', `/api/tasks/${first.id}`, { status: 'doing' });
+  await rejectedUnchanged(f, 'PATCH', `/api/tasks/${first.id}`, { evidence: '验收后覆盖原证据' });
+  assert.equal((await ok(f, 'GET', '/api/court')).stats.completed, 1);
+});
+
+test('returned court proposals can be revised and resubmitted while preserving step identities', async t => {
+  const f = await fixture(t);
+  let proposal = await courtProposal(f);
+  const stepIds = proposal.steps.map(step => step.id);
+  proposal = (await courtTransition(f, proposal, 'submit')).proposal;
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/review`, { revision: proposal.revision, decision: 'return', note: '' }, 400);
+  proposal = (await courtTransition(f, proposal, 'review', { decision: 'return', note: '请补充如何验证真实运行结果' })).proposal;
+  assert.equal(proposal.status, 'returned');
+  assert.equal(proposal.revision, 3);
+  proposal = (await ok(f, 'PATCH', `/api/court/proposals/${proposal.id}`, {
+    ...proposalBody({ title: '补充验收证据后的计划', steps: proposal.steps.map((step, index) => ({ ...step, acceptance: `${step.acceptance}；验证条目 ${index + 1}` })) }),
+    revision: proposal.revision
+  })).proposal;
+  assert.equal(proposal.revision, 4);
+  assert(['draft', 'returned'].includes(proposal.status));
+  assert.deepEqual(proposal.steps.map(step => step.id), stepIds);
+  assert.equal(proposal.title, '补充验收证据后的计划');
+  proposal = (await courtTransition(f, proposal, 'submit')).proposal;
+  assert.equal(proposal.status, 'review');
+  assert.equal(proposal.revision, 5);
+  proposal = (await courtTransition(f, proposal, 'review', { decision: 'approve', note: '修改后满足验收要求' })).proposal;
+  assert.equal(proposal.status, 'approved');
+  assert.equal(proposal.revision, 6);
+  await rejectedUnchanged(f, 'PATCH', `/api/court/proposals/${proposal.id}`, { ...proposalBody(), revision: proposal.revision });
+});
+
+test('court rejects approval bypasses and incomplete execution plans without creating tasks', async t => {
+  const f = await fixture(t);
+  const draft = await courtProposal(f);
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${draft.id}/review`, { revision: draft.revision, decision: 'approve' });
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${draft.id}/dispatch`, { revision: draft.revision });
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${draft.id}/accept`, { revision: draft.revision, note: '跳过审批与执行' });
+  const underReview = (await courtTransition(f, draft, 'submit')).proposal;
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${draft.id}/dispatch`, { revision: underReview.revision });
+  const badPlans = [
+    { intent: '' }, { steps: [] },
+    { steps: [{ title: '', minutes: 20, acceptance: '有结果' }] },
+    { steps: [{ title: '没有验收条件', minutes: 20, acceptance: '' }] },
+    { steps: [{ title: '无效估时', minutes: 0, acceptance: '有结果' }] },
+    { steps: [{ title: '超出估时上限', minutes: 1441, acceptance: '有结果' }] },
+    { steps: Array.from({ length: 9 }, (_, index) => ({ title: `步骤 ${index}`, minutes: 10, acceptance: '有结果' })) }
+  ];
+  for (const patch of badPlans) {
+    const before = await ok(f, 'GET', '/api/export');
+    const created = await f.request('POST', '/api/court/proposals', proposalBody(patch));
+    if (created.status === 400) {
+      assert.deepEqual(await ok(f, 'GET', '/api/export'), before);
+      continue;
+    }
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const incomplete = created.body.proposal;
+    await rejectedUnchanged(f, 'POST', `/api/court/proposals/${incomplete.id}/submit`, { revision: incomplete.revision }, 400);
+  }
+  assert.equal((await ok(f, 'GET', '/api/tasks')).length, 0);
+  await rejectedUnchanged(f, 'POST', '/api/court/proposals', proposalBody({ dept: '不存在的部门' }), 400);
+});
+
+test('court stale revisions reject atomically and competing approvals have only one winner', async t => {
+  const f = await fixture(t);
+  let proposal = await courtProposal(f);
+  await rejectedUnchanged(f, 'PATCH', `/api/court/proposals/${proposal.id}`, { ...proposalBody({ title: '无效版本' }), revision: 0 }, 400);
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/submit`, { revision: 0 }, 400);
+  proposal = (await ok(f, 'PATCH', `/api/court/proposals/${proposal.id}`, { ...proposalBody({ title: '当前草稿版本', steps: proposal.steps }), revision: proposal.revision })).proposal;
+  await rejectedUnchanged(f, 'PATCH', `/api/court/proposals/${proposal.id}`, { ...proposalBody({ title: '过期修改' }), revision: 1 }, 409);
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/submit`, { revision: 1 }, 409);
+  proposal = (await courtTransition(f, proposal, 'submit')).proposal;
+  const reviewRevision = proposal.revision;
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/review`, { revision: reviewRevision - 1, decision: 'approve' }, 409);
+  const approvals = await Promise.all([
+    f.request('POST', `/api/court/proposals/${proposal.id}/review`, { revision: proposal.revision, decision: 'approve', note: '第一次审批' }),
+    f.request('POST', `/api/court/proposals/${proposal.id}/review`, { revision: proposal.revision, decision: 'approve', note: '并发审批' })
+  ]);
+  assert.deepEqual(approvals.map(response => response.status).sort(), [200, 409]);
+  proposal = approvals.find(response => response.status === 200).body.proposal;
+  assert.equal(proposal.revision, reviewRevision + 1);
+  const approvedRevision = proposal.revision;
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/dispatch`, { revision: reviewRevision }, 409);
+  const dispatched = await courtTransition(f, proposal, 'dispatch');
+  proposal = dispatched.proposal;
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/accept`, { revision: approvedRevision, note: '过期验收' }, 409);
+  for (const task of dispatched.tasks) await ok(f, 'PATCH', `/api/tasks/${task.id}`, { status: 'done', evidence: '实际验证完成' });
+  await rejectedUnchanged(f, 'POST', `/api/court/proposals/${proposal.id}/accept`, { revision: approvedRevision, note: '完成后仍不可用过期版本验收' }, 409);
+  proposal = (await ok(f, 'GET', `/api/court/proposals/${proposal.id}`)).proposal;
+  const accepted = await courtTransition(f, proposal, 'accept', { note: '使用当前版本验收' });
+  assert.equal(accepted.proposal.status, 'completed');
+});
+
+test('repeated dispatches return the same tasks without duplicating tasks or audit events', async t => {
+  const f = await fixture(t);
+  let proposal = await courtApproved(f);
+  const approvedRevision = proposal.revision;
+  const first = await courtTransition(f, proposal, 'dispatch');
+  proposal = first.proposal;
+  const beforeRepeats = await ok(f, 'GET', '/api/export');
+  const repeats = await Promise.all([
+    f.request('POST', `/api/court/proposals/${proposal.id}/dispatch`, { revision: approvedRevision }),
+    f.request('POST', `/api/court/proposals/${proposal.id}/dispatch`, { revision: 1 }),
+    f.request('POST', `/api/court/proposals/${proposal.id}/dispatch`, { revision: proposal.revision })
+  ]);
+  for (const response of repeats) {
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.tasks.map(task => task.id), first.tasks.map(task => task.id));
+    assert.equal(response.body.proposal.revision, proposal.revision);
+  }
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), beforeRepeats, 'Idempotent dispatch must not append duplicate audit events');
+  for (const task of first.tasks) await ok(f, 'PATCH', `/api/tasks/${task.id}`, { status: 'done', evidence: '验证步骤对应结果' });
+  proposal = (await ok(f, 'GET', `/api/court/proposals/${proposal.id}`)).proposal;
+  proposal = (await courtTransition(f, proposal, 'accept', { note: '验收步骤与证据一致' })).proposal;
+  const beforeCompletedRepeat = await ok(f, 'GET', '/api/export');
+  const repeatedAfterCompletion = await ok(f, 'POST', `/api/court/proposals/${proposal.id}/dispatch`, { revision: 1 });
+  assert.deepEqual(repeatedAfterCompletion.tasks.map(task => task.id), first.tasks.map(task => task.id));
+  assert.equal(repeatedAfterCompletion.proposal.status, 'completed');
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), beforeCompletedRepeat);
+});
+
+test('court counts only real work per department and preserves schema-3 data through restart', async t => {
+  const current = new Date('2026-09-28T04:00:00.000Z');
+  const f = await fixture(t, { start: false, clock: () => current });
+  const legacy = {
+    schemaVersion: 3,
+    legacyMetadata: { retained: 'custom schema-3 extension' },
+    goals: [{ id: 'legacy-goal', title: '旧目标仍存在', status: 'active', createdAt: '2026-09-27T01:00:00.000Z' }],
+    tasks: [
+      { id: 'demo-task', title: '演示不参与统计', dept: '兵部', status: '已完成', minutes: 900, evidence: 'demo', isDemo: true, completedAt: current.toISOString() },
+      { id: 'legacy-active', title: '真实旧任务', dept: '礼部', status: '执行中', minutes: 20, goalId: 'legacy-goal', dueAt: '2026-09-27T01:00:00.000Z', createdAt: '2026-09-27T00:00:00.000Z' },
+      { id: 'legacy-done', title: '真实已完成任务', dept: '工部', status: '已完成', minutes: 30, evidence: '旧任务完成证据', completedAt: current.toISOString() },
+      { id: 'legacy-unassigned', title: '未知部门待归类', dept: '旧分类', status: '待确认', minutes: 5, createdAt: current.toISOString() }
+    ],
+    reading: [{ id: 'legacy-book', title: '旧阅读记录', note: '迁移后保留', source: 'manual', sourceId: 'legacy-book', createdAt: current.toISOString(), reviews: [] }]
+  };
+  fs.writeFileSync(path.join(f.directory, 'store.json'), JSON.stringify(legacy), 'utf8');
+  await f.start();
+  const initial = await ok(f, 'GET', '/api/court');
+  assert.equal(initial.provinces.length, 3);
+  assert(initial.provinces.every(province => province.id && province.name && province.role && Number.isInteger(province.pending)));
+  assert.deepEqual(initial.departments.map(department => department.id).sort(), ['吏部', '户部', '礼部', '兵部', '刑部', '工部'].sort());
+  assert(initial.departments.every(department => department.name && department.role && department.description));
+  assert.equal(initial.unassignedCount, 1);
+  const initialRites = initial.departments.find(department => department.id === '礼部');
+  assert.equal(initialRites.active, 1);
+  assert.equal(initialRites.completed, 0);
+  assert.equal(initialRites.estimatedMinutes, 20);
+  assert.equal(initialRites.overdue, 1);
+  assert.equal(initialRites.goalCount, 1);
+  const military = initial.departments.find(department => department.id === '兵部');
+  assert.equal(military.active, 0);
+  assert.equal(military.completed, 0);
+  assert.equal(military.estimatedMinutes, 0);
+  assert.equal(initial.departments.find(department => department.id === '工部').completed, 1);
+
+  await courtProposal(f, { title: '仍在拟议', dept: '兵部' });
+  const reviewing = await courtProposal(f, { title: '门下待审', dept: '工部' });
+  await courtTransition(f, reviewing, 'submit');
+  let returned = await courtProposal(f, { title: '退回补充', dept: '刑部' });
+  returned = (await courtTransition(f, returned, 'submit')).proposal;
+  await courtTransition(f, returned, 'review', { decision: 'return', note: '补充验收标准' });
+  await courtApproved(f, { title: '待尚书派发', dept: '吏部' });
+  const executing = await courtApproved(f, { title: '户部实际执行', dept: '户部', goalId: 'legacy-goal', steps: [{ title: '核对资源', minutes: 40, acceptance: '给出核对结果' }] });
+  await courtTransition(f, executing, 'dispatch');
+  const ready = await courtApproved(f, { title: '礼部已经验收', dept: '礼部', steps: [{ title: '学习实践', minutes: 15, acceptance: '提交实践证据' }] });
+  const completed = await courtTransition(f, ready, 'dispatch');
+  await ok(f, 'PATCH', `/api/tasks/${completed.tasks[0].id}`, { status: 'done', evidence: '实践结果已记录' });
+  const acceptanceProposal = (await ok(f, 'GET', `/api/court/proposals/${completed.proposal.id}`)).proposal;
+  await courtTransition(f, acceptanceProposal, 'accept', { note: '核对实际结果后验收' });
+  const court = await ok(f, 'GET', '/api/court');
+  assert.deepEqual(court.stats, { drafts: 1, review: 1, returned: 1, approved: 1, executing: 1, completed: 1 });
+  assert.equal(court.departments.find(department => department.id === '户部').active, 1);
+  assert.equal(court.departments.find(department => department.id === '户部').estimatedMinutes, 40);
+  assert.equal(court.departments.find(department => department.id === '户部').goalCount, 1);
+  assert.equal(court.departments.find(department => department.id === '礼部').active, 1);
+  assert.equal(court.departments.find(department => department.id === '礼部').completed, 1);
+  assert.equal(court.departments.find(department => department.id === '礼部').overdue, 1);
+  assert.equal(court.unassignedCount, 1);
+  assert.deepEqual((await ok(f, 'GET', '/api/state')).court, court);
+  const saved = await ok(f, 'GET', '/api/export');
+  assert.equal(saved.schemaVersion, 4);
+  assert.deepEqual(saved.legacyMetadata, legacy.legacyMetadata);
+  assert.deepEqual(saved.reading, legacy.reading);
+  assert.equal(saved.proposals.length, 6);
+  await f.restart();
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), saved);
+  assert.deepEqual(await ok(f, 'GET', '/api/court'), court);
 });
