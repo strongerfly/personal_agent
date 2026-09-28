@@ -1,0 +1,10 @@
+data/
+node_modules/
+*.log
+*.tmp
+.env
+.env.*
+credentials.*
+.codex/
+.Codex/
+.DS_Store

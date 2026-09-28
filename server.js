@@ -1,461 +1,431 @@
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const http = require('http');
-const { URL } = require('url');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const http = require('node:http');
+const { createIntegrations, validateSettings } = require('./lib/integrations');
 
-const PORT = Number(process.env.PORT || 3000);
-const DIST_DIR = path.join(__dirname, 'dist');
-const DATA_DIR = path.join(__dirname, 'data');
-const STORE_FILE = path.join(DATA_DIR, 'store.json');
-const OBSIDIAN_VAULT_DIR = process.env.OBSIDIAN_VAULT_PATH ? path.resolve(process.env.OBSIDIAN_VAULT_PATH) : path.join(DATA_DIR, 'obsidian-vault');
-
-const seedTasks = [
-  { id: 1, title: '补齐客户方案的成本测算页', dept: '兵部', owner: '尚书省调度', due: '今天 14:00', status: '执行中', priority: '高', tone: 'red' },
-  { id: 2, title: '完成数据分析练习：分组对比', dept: '礼部', owner: '吏部成长计划', due: '今天 16:00', status: '待确认', priority: '中', tone: 'orange' },
-  { id: 3, title: '把会议纪要转成三个行动项', dept: '兵部', owner: '通政司', due: '今天 11:30', status: '已完成', priority: '中', tone: 'jade' },
-  { id: 4, title: '整理本周视频引用与时间码', dept: '翰林院', owner: '史官周报', due: '今天 17:00', status: '执行中', priority: '低', tone: 'blue' },
-  { id: 5, title: '复盘两个顺延任务的估时偏差', dept: '刑部', owner: '史馆复盘', due: '明天 10:00', status: '待确认', priority: '中', tone: 'orange' },
-  { id: 6, title: '清理一个重复的自动化提醒', dept: '工部', owner: '系统维护', due: '今天 18:00', status: '已完成', priority: '低', tone: 'jade' }
-];
-
-const freshStore = () => ({
-  schemaVersion: 2,
-  tasks: seedTasks.map(task => ({ ...task })),
-  petitions: [],
-  reading: [],
-  digests: [],
-  events: [],
-  automation: { enabled: false, dailyHour: 21, weeklyDay: 0, weeklyHour: 21, lastDailyRunDate: null, lastWeeklyRunDate: null },
-  integrations: { obsidian: { lastExportAt: null, lastExportFiles: [] } }
-});
-
-function ensureStore() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(STORE_FILE)) fs.writeFileSync(STORE_FILE, JSON.stringify(freshStore(), null, 2), 'utf8');
+const DAY = 86400000;
+const ZONE = 8 * 3600000;
+const DEMOS = ['补齐客户方案的成本测算页', '完成数据分析练习：分组对比', '把会议纪要转成三个行动项', '整理本周视频引用与时间码', '复盘两个顺延任务的估时偏差', '清理一个重复的自动化提醒'];
+const id = () => crypto.randomUUID();
+const hash = value => crypto.createHash('sha256').update(String(value)).digest('hex');
+const dayKey = date => new Date(+new Date(date) + ZONE).toISOString().slice(0, 10);
+const dayStart = date => Date.parse(`${dayKey(date)}T00:00:00+08:00`);
+const inRange = (value, start, end) => Number.isFinite(Date.parse(value)) && Date.parse(value) >= start && Date.parse(value) < end;
+const done = task => task.status === '已完成';
+const fail = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+const text = (value, max = 2000) => typeof value === 'string' ? value.trim().slice(0, max) : '';
+function required(value, label, max = 300) {
+  const result = text(value, max);
+  if (!result) throw fail(`请填写${label}`);
+  return result;
 }
-
-function readStore() {
-  ensureStore();
-  try {
-    const parsed = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
-    const base = freshStore();
-    return {
-      ...base,
-      ...parsed,
-      schemaVersion: 2,
-      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : base.tasks,
-      petitions: Array.isArray(parsed.petitions) ? parsed.petitions : [],
-      reading: Array.isArray(parsed.reading) ? parsed.reading : [],
-      digests: Array.isArray(parsed.digests) ? parsed.digests : [],
-      events: Array.isArray(parsed.events) ? parsed.events : [],
-      automation: { ...base.automation, ...(parsed.automation || {}) },
-      integrations: { ...base.integrations, ...(parsed.integrations || {}), obsidian: { ...base.integrations.obsidian, ...((parsed.integrations || {}).obsidian || {}) } }
-    };
-  } catch (error) {
-    console.warn('store.json 无法读取，已恢复演示数据:', error.message);
-    const fallback = freshStore();
-    fs.writeFileSync(STORE_FILE, JSON.stringify(fallback, null, 2), 'utf8');
-    return fallback;
-  }
+function dateValue(value) {
+  if (!value) return '';
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw fail('日期格式无效');
+  return new Date(value).toISOString();
 }
-
-let store = readStore();
-
-function persist() {
-  const tempFile = `${STORE_FILE}.tmp-${process.pid}`;
-  fs.writeFileSync(tempFile, JSON.stringify(store, null, 2), 'utf8');
-  fs.renameSync(tempFile, STORE_FILE);
+function taskStatus(value) {
+  const status = ({ todo: '待确认', doing: '执行中', done: '已完成', deferred: '已顺延' })[value] || value;
+  if (!['待确认', '执行中', '已完成', '已顺延'].includes(status)) throw fail('任务状态无效');
+  return status;
 }
-
-function writeTextAtomic(filePath, content) {
-  const tempFile = `${filePath}.tmp-${process.pid}`;
-  fs.writeFileSync(tempFile, content, 'utf8');
-  fs.renameSync(tempFile, filePath);
-}
-
-function sendJson(res, statusCode, payload, extraHeaders = {}) {
-  const body = JSON.stringify(payload);
-  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders });
-  res.end(body);
-}
-
-function sendError(res, statusCode, message) {
-  sendJson(res, statusCode, { error: message });
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > 1024 * 1024) {
-        reject(new Error('请求体过大'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => {
-      if (!body) return resolve({});
-      try { resolve(JSON.parse(body)); } catch (error) { reject(new Error('请求必须是 JSON')); }
-    });
-    req.on('error', reject);
-  });
-}
-
-function cleanText(value, maxLength = 500) {
-  return String(value ?? '').trim().slice(0, maxLength);
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-}
-
-function findById(items, id) {
-  return items.find(item => String(item.id) === String(id));
-}
-
-function timestamp(value) {
-  if (typeof value === 'number') return value;
-  const parsed = Date.parse(value || '');
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function recordEvent(type, payload = {}) {
-  store.events.unshift({ id: makeId('e'), type, createdAt: new Date().toISOString(), payload });
-  store.events = store.events.slice(0, 500);
-}
-
-function normalizeReadingItem(item, source = 'wechat_reading') {
-  if (!item || typeof item !== 'object') return null;
-  const title = cleanText(item.title, 240);
-  if (!title) return null;
-  const tags = Array.isArray(item.tags) ? item.tags.map(tag => cleanText(tag, 40)).filter(Boolean).slice(0, 12) : [];
-  const effectiveSource = cleanText(item.source, 60) || source;
-  const fingerprint = crypto.createHash('sha1').update([effectiveSource, title, cleanText(item.author, 160), cleanText(item.quote, 2000), cleanText(item.finishedAt, 40)].join('|')).digest('hex');
+function freshStore() {
   return {
-    id: cleanText(item.id, 100) || makeId('r'),
-    source: effectiveSource,
-    title,
-    author: cleanText(item.author, 160),
-    progress: Math.max(0, Math.min(100, Number(item.progress) || 0)),
-    note: cleanText(item.note, 2000),
-    quote: cleanText(item.quote, 2000),
-    url: cleanText(item.url, 500),
-    tags,
-    finishedAt: cleanText(item.finishedAt, 40),
-    importedAt: cleanText(item.importedAt, 40) || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    fingerprint
+    schemaVersion: 3, tasks: [], petitions: [], reading: [], digests: [], goals: [], checkins: [], runs: [], events: [], aiAnalyses: [],
+    settings: { vaultPath: '', readingFolder: 'WeRead', ai: { enabled: false, baseUrl: '', model: '' } },
+    automation: { enabled: false, dailyHour: 21, weeklyDay: 0, weeklyHour: 21, autoImport: false, timezone: 'Asia/Shanghai', lastDailyRunDate: null, lastWeeklyRunDate: null },
+    integrations: { obsidian: { lastExportAt: null, lastExportFiles: [] } }
   };
 }
-
-function slugify(value) {
-  return cleanText(value, 100).replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'note';
+function migrate(parsed) {
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw fail('数据文件结构无效，原文件已保留', 500);
+  const base = freshStore();
+  for (const key of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'runs', 'events', 'aiAnalyses']) {
+    if (parsed[key] !== undefined && !Array.isArray(parsed[key])) throw fail(`数据字段 ${key} 无效，原文件已保留`, 500);
+  }
+  const result = { ...base, ...parsed, schemaVersion: 3 };
+  result.settings = { ...base.settings, ...parsed.settings, ai: { ...base.settings.ai, ...parsed.settings?.ai } };
+  result.automation = { ...base.automation, ...parsed.automation, timezone: 'Asia/Shanghai' };
+  result.integrations = { ...base.integrations, ...parsed.integrations };
+  if ((parsed.schemaVersion || 1) < 3) {
+    result.tasks = result.tasks.map(task => ({ ...task, isDemo: task.isDemo || (typeof task.id === 'number' && DEMOS[task.id - 1] === task.title), completedAt: task.completedAt || (done(task) ? task.updatedAt : undefined) }));
+    result.reading = result.reading.map(item => ({ ...item, createdAt: item.createdAt || item.importedAt || item.updatedAt, reviewCount: item.reviewCount || 0, reviews: item.reviews || [] }));
+  }
+  return result;
 }
 
-function buildDigest(period, trigger = 'manual') {
-  const days = period === 'weekly' ? 7 : 1;
-  const since = Date.now() - days * 24 * 60 * 60 * 1000;
-  const completedTasks = store.tasks.filter(task => task.status === '已完成' && timestamp(task.updatedAt || task.createdAt) >= since);
-  const pendingTasks = store.tasks.filter(task => task.status !== '已完成');
-  const recentReading = store.reading.filter(item => timestamp(item.importedAt || item.updatedAt) >= since);
-  const recentEvents = store.events.filter(event => timestamp(event.createdAt) >= since).slice(0, 20);
-  const focusTasks = pendingTasks.filter(task => task.priority === '高' || task.status === '待确认').slice(0, 3);
-  const actionItems = focusTasks.map(task => ({ title: task.title, dept: task.dept, status: task.status, priority: task.priority }));
-  const highlights = [
-    ...completedTasks.slice(0, 5).map(task => `已完成：${task.title}`),
-    ...recentReading.slice(0, 5).map(item => `阅读：${item.title}${item.progress ? `（${item.progress}%）` : ''}`)
-  ];
-  if (!highlights.length) highlights.push('本周期还没有足够的完成记录，建议先捕获一条真实事务。');
-  const title = period === 'weekly' ? '本周整理' : '今日整理';
-  const markdown = [`# ${title}`, '', `生成时间：${new Date().toLocaleString('zh-CN')}`, '', '## 关键进展', ...highlights.map(item => `- ${item}`), '', '## 下一步动作', ...(actionItems.length ? actionItems.map(item => `- [ ] ${item.title}（${item.dept} · ${item.priority}）`) : ['- [ ] 暂无明确动作，请先补充输入']), '', '## 数据统计', `- 完成任务：${completedTasks.length}`, `- 待处理任务：${pendingTasks.length}`, `- 新增阅读：${recentReading.length}`, `- 记录事件：${recentEvents.length}`].join('\n');
-  const digest = { id: makeId('d'), period, trigger, createdAt: new Date().toISOString(), windowStart: new Date(since).toISOString(), stats: { completedTasks: completedTasks.length, pendingTasks: pendingTasks.length, reading: recentReading.length, events: recentEvents.length }, highlights, actionItems, markdown };
-  store.digests.unshift(digest);
-  store.digests = store.digests.slice(0, 100);
-  recordEvent('organize.run', { period, trigger, digestId: digest.id });
-  persist();
-  return digest;
-}
-
-function exportToObsidian() {
-  const readingDir = path.join(OBSIDIAN_VAULT_DIR, '10-阅读');
-  const digestDir = path.join(OBSIDIAN_VAULT_DIR, '20-整理');
-  fs.mkdirSync(readingDir, { recursive: true });
-  fs.mkdirSync(digestDir, { recursive: true });
-  const files = [];
-  for (const item of store.reading) {
-    const fileName = `${slugify(item.title)}-${String(item.id).slice(-8)}.md`;
-    const content = [`# ${item.title}`, '', item.author ? `作者：${item.author}` : '', `来源：${item.source}`, `进度：${item.progress}%`, item.url ? `原文：${item.url}` : '', '', '## 摘要与笔记', item.note || '暂无笔记', '', '## 摘录', item.quote || '暂无摘录', '', item.tags.length ? `标签：${item.tags.map(tag => `#${slugify(tag)}`).join(' ')}` : ''].filter(Boolean).join('\n');
-    writeTextAtomic(path.join(readingDir, fileName), `${content}\n`);
-    files.push(path.join('10-阅读', fileName));
-  }
-  for (const digest of store.digests.slice(0, 20)) {
-    const fileName = `${digest.createdAt.slice(0, 10)}-${digest.period}-${digest.id.slice(-8)}.md`;
-    writeTextAtomic(path.join(digestDir, fileName), `${digest.markdown}\n`);
-    files.push(path.join('20-整理', fileName));
-  }
-  const index = ['# 个人朝廷 OS', '', '这个目录由个人朝廷 OS 自动生成。', '', '## 最近整理', ...store.digests.slice(0, 20).map(digest => `- [[20-整理/${digest.createdAt.slice(0, 10)}-${digest.period}-${digest.id.slice(-8)}]]`), '', '## 阅读记录', ...store.reading.slice(0, 100).map(item => `- [[10-阅读/${slugify(item.title)}-${String(item.id).slice(-8)}]]`)].join('\n');
-  writeTextAtomic(path.join(OBSIDIAN_VAULT_DIR, 'README.md'), `${index}\n`);
-  files.push('README.md');
-  store.integrations.obsidian.lastExportAt = new Date().toISOString();
-  store.integrations.obsidian.lastExportFiles = files;
-  recordEvent('obsidian.export', { vaultPath: OBSIDIAN_VAULT_DIR, fileCount: files.length });
-  persist();
-  return { vaultPath: OBSIDIAN_VAULT_DIR, files, exportedAt: store.integrations.obsidian.lastExportAt };
-}
-
-function overview() {
-  return {
-    tasks: { total: store.tasks.length, pending: store.tasks.filter(task => task.status !== '已完成').length, completed: store.tasks.filter(task => task.status === '已完成').length },
-    petitionsPending: store.petitions.filter(petition => petition.status !== '已转任务').length,
-    readingCount: store.reading.length,
-    digestCount: store.digests.length,
-    latestDigest: store.digests[0] || null,
-    automation: store.automation,
-    obsidian: { ...store.integrations.obsidian, vaultPath: OBSIDIAN_VAULT_DIR }
-  };
-}
-
-function checkAutomationSchedule() {
-  if (!store.automation.enabled) return;
-  const now = new Date();
-  const dateKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(now);
-  const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false, hourCycle: 'h23' }).format(now)) % 24;
-  const weekdayName = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Shanghai', weekday: 'short' }).format(now);
-  const weekday = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[weekdayName];
-  if (hour === store.automation.dailyHour && store.automation.lastDailyRunDate !== dateKey) {
-    buildDigest('daily', 'schedule');
-    store.automation.lastDailyRunDate = dateKey;
-    persist();
-    console.log(`已完成 ${dateKey} 的每日整理`);
-  }
-  if (weekday === store.automation.weeklyDay && hour === store.automation.weeklyHour && store.automation.lastWeeklyRunDate !== dateKey) {
-    buildDigest('weekly', 'schedule');
-    store.automation.lastWeeklyRunDate = dateKey;
-    persist();
-    console.log(`已完成 ${dateKey} 的每周整理`);
-  }
-}
-
-function handleApi(req, res, pathname, query) {
-  if (req.method === 'GET' && pathname === '/api/health') {
-    return sendJson(res, 200, { ok: true, service: 'personal-court-os', storage: 'data/store.json', overview: overview() });
-  }
-
-  if (req.method === 'GET' && pathname === '/api/overview') {
-    return sendJson(res, 200, overview());
-  }
-
-  if (req.method === 'GET' && pathname === '/api/events') {
-    const limit = Math.max(1, Math.min(100, Number(query.get('limit')) || 30));
-    return sendJson(res, 200, { events: store.events.slice(0, limit) });
-  }
-
-  if (req.method === 'GET' && pathname === '/api/digests') {
-    const period = query.get('period');
-    const digests = period ? store.digests.filter(digest => digest.period === period) : store.digests;
-    return sendJson(res, 200, { digests: digests.slice(0, 50) });
-  }
-
-  if (req.method === 'GET' && pathname.startsWith('/api/digests/')) {
-    const digest = findById(store.digests, decodeURIComponent(pathname.slice('/api/digests/'.length)));
-    return digest ? sendJson(res, 200, { digest }) : sendError(res, 404, '整理记录不存在');
-  }
-
-  if (req.method === 'POST' && pathname === '/api/organize/run') {
-    return readBody(req).then(body => {
-      const period = body.period === 'weekly' ? 'weekly' : 'daily';
-      sendJson(res, 201, { digest: buildDigest(period, 'manual') });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'GET' && pathname === '/api/automation/config') {
-    return sendJson(res, 200, { automation: store.automation });
-  }
-
-  if ((req.method === 'PATCH' || req.method === 'PUT') && pathname === '/api/automation/config') {
-    return readBody(req).then(body => {
-      if (body.enabled !== undefined) store.automation.enabled = typeof body.enabled === 'string' ? body.enabled.toLowerCase() === 'true' : body.enabled === true;
-      if (body.dailyHour !== undefined) store.automation.dailyHour = Math.max(0, Math.min(23, Number(body.dailyHour) || 0));
-      if (body.weeklyDay !== undefined) store.automation.weeklyDay = Math.max(0, Math.min(6, Number(body.weeklyDay) || 0));
-      if (body.weeklyHour !== undefined) store.automation.weeklyHour = Math.max(0, Math.min(23, Number(body.weeklyHour) || 0));
-      persist();
-      sendJson(res, 200, { automation: store.automation });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'GET' && pathname === '/api/reading') {
-    return sendJson(res, 200, { reading: store.reading });
-  }
-
-  if (req.method === 'POST' && (pathname === '/api/reading/import' || pathname === '/api/integrations/wechat-reading/import')) {
-    return readBody(req).then(body => {
-      const source = cleanText(body.source, 60) || 'wechat_reading';
-      const input = Array.isArray(body) ? body : body.items;
-      if (!Array.isArray(input)) return sendError(res, 400, 'items 必须是数组');
-      const imported = [];
-      const skipped = [];
-      for (const rawItem of input.slice(0, 500)) {
-        const item = normalizeReadingItem(rawItem, source);
-        if (!item) { skipped.push('缺少标题'); continue; }
-        const duplicate = store.reading.find(existing => existing.fingerprint === item.fingerprint || (existing.source === item.source && existing.id === item.id));
-        if (duplicate) { skipped.push(item.title); continue; }
-        store.reading.unshift(item);
-        imported.push(item);
-      }
-      recordEvent('reading.import', { source, imported: imported.length, skipped: skipped.length });
-      persist();
-      sendJson(res, 201, { imported, skipped, total: store.reading.length });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'GET' && pathname === '/api/obsidian/status') {
-    return sendJson(res, 200, { obsidian: { ...store.integrations.obsidian, vaultPath: OBSIDIAN_VAULT_DIR } });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/obsidian/preview') {
-    const files = ['README.md', ...store.reading.map(item => path.join('10-阅读', `${slugify(item.title)}-${String(item.id).slice(-8)}.md`).replace(/\\/g, '/')), ...store.digests.slice(0, 20).map(digest => path.join('20-整理', `${digest.createdAt.slice(0, 10)}-${digest.period}-${digest.id.slice(-8)}.md`).replace(/\\/g, '/'))];
-    return sendJson(res, 200, { vaultPath: OBSIDIAN_VAULT_DIR, files, requiresApproval: true });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/obsidian/export') {
-    return readBody(req).then(body => {
-      if (body.approved !== true) return sendError(res, 400, '导出前需要 approved=true');
-      sendJson(res, 201, { export: exportToObsidian() });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'GET' && pathname === '/api/tasks') {
-    const tasks = store.tasks.filter(task => (!query.get('dept') || task.dept === query.get('dept')) && (!query.get('status') || task.status === query.get('status')));
-    return sendJson(res, 200, { tasks });
-  }
-
-  if (req.method === 'PATCH' && pathname.startsWith('/api/tasks/')) {
-    const task = findById(store.tasks, decodeURIComponent(pathname.slice('/api/tasks/'.length)));
-    if (!task) return sendError(res, 404, '任务不存在');
-    return readBody(req).then(body => {
-      if (!['待确认', '执行中', '已完成'].includes(body.status)) return sendError(res, 400, '不支持的任务状态');
-      task.status = body.status;
-      task.updatedAt = new Date().toISOString();
-      recordEvent('task.status_changed', { taskId: task.id, status: task.status });
-      persist();
-      sendJson(res, 200, { task });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'GET' && pathname === '/api/petitions') {
-    return sendJson(res, 200, { petitions: store.petitions });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/petitions') {
-    return readBody(req).then(body => {
-      const title = cleanText(body.title, 200);
-      if (!title) return sendError(res, 400, '事务标题不能为空');
-      const status = body.status === '草稿' ? '草稿' : '已递交';
-      const petition = {
-        id: makeId('p'),
-        title,
-        dept: cleanText(body.dept, 30) || '兵部',
-        priority: ['高', '中', '低'].includes(body.priority) ? body.priority : '中',
-        dueAt: cleanText(body.dueAt, 40),
-        note: cleanText(body.note, 1000),
-        status,
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      store.petitions.unshift(petition);
-      recordEvent('petition.created', { petitionId: petition.id, status: petition.status, dept: petition.dept });
-      persist();
-      sendJson(res, 201, { petition });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'PATCH' && pathname.startsWith('/api/petitions/')) {
-    const petition = findById(store.petitions, decodeURIComponent(pathname.slice('/api/petitions/'.length)));
-    if (!petition) return sendError(res, 404, '奏折不存在');
-    return readBody(req).then(body => {
-      if (!['草稿', '已递交', '已转任务'].includes(body.status)) return sendError(res, 400, '不支持的奏折状态');
-      petition.status = body.status;
-      petition.updatedAt = Date.now();
-      recordEvent('petition.status_changed', { petitionId: petition.id, status: petition.status });
-      persist();
-      sendJson(res, 200, { petition });
-    }).catch(error => sendError(res, 400, error.message));
-  }
-
-  if (req.method === 'POST' && pathname.startsWith('/api/petitions/') && pathname.endsWith('/convert')) {
-    const id = decodeURIComponent(pathname.slice('/api/petitions/'.length, -'/convert'.length));
-    const petition = findById(store.petitions, id);
-    if (!petition) return sendError(res, 404, '奏折不存在');
-    if (petition.status !== '已递交') return sendError(res, 409, '只有已递交的奏折可以转成任务');
-    const task = {
-      id: Date.now(),
-      sourcePetitionId: petition.id,
-      title: petition.title,
-      dept: petition.dept,
-      owner: '尚书省调度',
-      due: petition.dueAt ? new Date(petition.dueAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '待排期',
-      status: '待确认',
-      priority: petition.priority,
-      tone: petition.priority === '高' ? 'red' : petition.priority === '低' ? 'blue' : 'orange',
-      createdAt: new Date().toISOString()
-    };
-    store.tasks.unshift(task);
-    petition.status = '已转任务';
-    petition.updatedAt = Date.now();
-    recordEvent('petition.converted_to_task', { petitionId: petition.id, taskId: task.id });
-    persist();
-    return sendJson(res, 201, { task, petition });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/reset') {
-    store = freshStore();
-    recordEvent('store.reset', {});
-    persist();
-    return sendJson(res, 200, store);
-  }
-
-  if (req.method === 'GET' && pathname === '/api/export') {
-    const body = JSON.stringify({ ...store, exportedAt: new Date().toISOString() }, null, 2);
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="personal-court-os-data.json"' });
-    return res.end(body);
-  }
-
-  return false;
-}
-
-const mimeTypes = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
-
-const server = http.createServer((req, res) => {
-  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  if (requestUrl.pathname.startsWith('/api/')) {
+function createApp(options = {}) {
+  const dataDir = path.resolve(options.dataDir || process.env.PERSONAL_AGENT_DATA_DIR || path.join(__dirname, 'data'));
+  const now = () => new Date(options.clock ? options.clock() : Date.now());
+  const stamp = () => now().toISOString();
+  fs.mkdirSync(dataDir, { recursive: true });
+  const storeFile = path.join(dataDir, 'store.json');
+  const lockFile = path.join(dataDir, 'server.lock');
+  const lockToken = `${process.pid}:${id()}`;
+  try { fs.writeFileSync(lockFile, lockToken, { flag: 'wx' }); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    // mkdir is an exclusive recovery mutex: competing starters cannot remove a new lock.
+    const recoveryDir = path.join(dataDir, 'server.lock-recovery');
+    try { fs.mkdirSync(recoveryDir); }
+    catch { throw fail('另一个进程正在恢复服务锁；若恢复中断，请确认服务已停止后检查 server.lock-recovery', 503); }
     try {
-      const handled = handleApi(req, res, requestUrl.pathname, requestUrl.searchParams);
-      if (handled === false) sendError(res, 404, 'API 路径不存在');
-      else Promise.resolve(handled).catch(error => sendError(res, 500, error.message));
-    } catch (error) {
-      sendError(res, 500, error.message);
-    }
-    return;
+      if (fs.existsSync(lockFile)) {
+        const pid = Number(fs.readFileSync(lockFile, 'utf8').split(':')[0]);
+        let active = true;
+        try { process.kill(pid, 0); } catch (probe) { if (probe.code === 'ESRCH') active = false; }
+        if (active || !Number.isInteger(pid) || pid < 1) throw fail('此数据目录已被另一个进程使用，请先停止原服务', 503);
+        fs.unlinkSync(lockFile);
+      }
+      fs.writeFileSync(lockFile, lockToken, { flag: 'wx' });
+    } finally { fs.rmdirSync(recoveryDir); }
   }
-
-  const requestedFile = requestUrl.pathname === '/' ? 'index.html' : requestUrl.pathname.replace(/^\/+/, '');
-  const filePath = path.resolve(DIST_DIR, requestedFile);
-  if (filePath !== DIST_DIR && !filePath.startsWith(`${DIST_DIR}${path.sep}`)) return sendError(res, 403, '禁止访问');
-  fs.readFile(filePath, (error, content) => {
-    if (error) return sendError(res, error.code === 'ENOENT' ? 404 : 500, error.code === 'ENOENT' ? '页面不存在' : '读取页面失败');
-    res.writeHead(200, { 'Content-Type': mimeTypes[path.extname(filePath).toLowerCase()] || 'application/octet-stream' });
-    res.end(content);
+  const release = () => { if (fs.existsSync(lockFile) && fs.readFileSync(lockFile, 'utf8') === lockToken) fs.unlinkSync(lockFile); };
+  let store;
+  try {
+    store = fs.existsSync(storeFile) ? migrate(JSON.parse(fs.readFileSync(storeFile, 'utf8'))) : freshStore();
+    if (!fs.existsSync(storeFile)) fs.writeFileSync(storeFile, JSON.stringify(store, null, 2), { flag: 'wx' });
+  } catch { release(); throw fail('无法读取数据文件；未覆盖原文件。请检查 store.json 或从 store.backup.json 恢复。', 500); }
+  function mutate(operation) {
+    const draft = structuredClone(store);
+    const result = operation(draft);
+    const temporary = `${storeFile}.${process.pid}.tmp`;
+    const backupTemp = path.join(dataDir, `store.backup.${process.pid}.tmp`);
+    fs.writeFileSync(temporary, JSON.stringify(draft, null, 2), { mode: 0o600 });
+    fs.copyFileSync(storeFile, backupTemp);
+    fs.renameSync(backupTemp, path.join(dataDir, 'store.backup.json'));
+    fs.renameSync(temporary, storeFile);
+    store = draft;
+    return result;
+  }
+  const event = (draft, type, sourceId, detail = '') => draft.events.push({ id: id(), type, sourceId, detail: text(detail, 300), createdAt: stamp() });
+  const integrations = createIntegrations({ dataDir, getStore: () => store });
+  const lookup = (draft, list, itemId) => {
+    const item = draft[list].find(entry => String(entry.id) === String(itemId));
+    if (!item) throw fail('记录不存在', 404);
+    return item;
+  };
+  function newTask(draft, body, source = {}) {
+    if (source.sourceId) {
+      const existing = draft.tasks.find(task => task.sourceId === source.sourceId && task.sourceType === source.sourceType);
+      if (existing) return existing;
+    }
+    const goalId = text(body.goalId);
+    if (goalId) lookup(draft, 'goals', goalId);
+    const minutes = body.minutes === undefined || body.minutes === '' ? 25 : Number(body.minutes);
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) throw fail('预计时间需在 1–1440 分钟之间');
+    const priority = ['高', '中', '低'].includes(body.priority) ? body.priority : '中';
+    const task = { id: id(), title: required(body.title, '行动标题'), dept: text(body.dept, 30) || '兵部', priority, status: '待确认', goalId, dueAt: dateValue(body.dueAt), minutes, evidence: '', createdAt: stamp(), updatedAt: stamp(), ...source };
+    draft.tasks.push(task); event(draft, 'task.created', task.id); return task;
+  }
+  function parseReading(body) {
+    if (Array.isArray(body.items)) return body.items;
+    if (body.format === 'json') {
+      let parsed;
+      try { parsed = JSON.parse(body.text); } catch { throw fail('JSON 格式无效，请检查括号和引号'); }
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && Array.isArray(parsed.items)) return parsed.items;
+      throw fail('JSON 应为数组或包含 items 数组的对象');
+    }
+    const raw = required(body.text, '导入内容', 200000);
+    const title = text(body.title, 300) || text(raw.match(/^#\s+(.+)$/m)?.[1], 300) || text(raw.split('\n').find(line => line.trim()), 80);
+    const quote = raw.split('\n').filter(line => /^>\s?/.test(line)).map(line => line.replace(/^>\s?/, '')).join('\n');
+    return [{ title, note: raw, quote, source: body.format === 'markdown' ? 'markdown' : 'manual', sourceId: hash(raw) }];
+  }
+  function importReading(items, origin = 'manual') {
+    if (!Array.isArray(items) || items.length > 500) throw fail('每批最多导入 500 条记录');
+    return mutate(draft => {
+      let imported = 0, updated = 0, skipped = 0;
+      const errors = [];
+      items.forEach((item, index) => {
+        try {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) throw fail('记录应为对象');
+          const title = required(item.title || item.bookTitle, '书名');
+          const source = text(item.source, 60) || origin;
+          const sourceId = text(String(item.sourceId || item.bookId || item.id || ''), 500) || hash([title, text(item.author), text(item.quote)].join('\n'));
+          const readingId = hash(`${source}:${sourceId}`);
+          let record = draft.reading.find(entry => entry.id === readingId || (entry.source === source && (entry.sourceId === sourceId || String(entry.id) === String(item.id) || (!entry.sourceId && entry.title === title && text(entry.author) === text(item.author) && text(entry.quote) === text(item.quote)))));
+          const progress = item.progress === undefined ? record?.progress : Number(item.progress);
+          if (progress !== undefined && (!Number.isFinite(progress) || progress < 0 || progress > 100)) throw fail('阅读进度需在 0–100 之间');
+          const content = { title, author: text(item.author, 200), note: text(item.note || item.notes || item.content, 30000), quote: text(item.quote || item.highlight, 20000), tags: Array.isArray(item.tags) ? item.tags.filter(tag => typeof tag === 'string').slice(0, 30).map(tag => text(tag, 60)) : [], progress, source, sourceId, sourcePath: text(item.sourcePath, 1000), url: /^https?:\/\//i.test(text(item.url)) ? text(item.url, 2000) : '', sourceUpdatedAt: item.sourceUpdatedAt ? dateValue(item.sourceUpdatedAt) : '' };
+          const fingerprint = hash(JSON.stringify(content));
+          if (record?.fingerprint === fingerprint) { skipped++; return; }
+          if (record) { Object.assign(record, content, { fingerprint, updatedAt: stamp() }); updated++; }
+          else {
+            record = { id: readingId, ...content, fingerprint, createdAt: stamp(), updatedAt: stamp(), nextReviewAt: stamp(), reviewCount: 0, reviewStep: 0, reviews: [] };
+            draft.reading.push(record); imported++;
+          }
+          event(draft, 'reading.imported', record.id);
+        } catch (error) { errors.push({ index, message: error.statusCode ? error.message : '此记录无法解析' }); }
+      });
+      return { imported, updated, skipped, failed: errors.length, errors, total: draft.reading.length };
+    });
+  }
+  function morning() {
+    const energy = [...store.checkins].reverse().find(checkin => dayKey(checkin.createdAt) === dayKey(now()))?.energy || 3;
+    const activeGoals = new Set(store.goals.filter(goal => goal.status === 'active').map(goal => goal.id));
+    const score = task => (task.dueAt && Date.parse(task.dueAt) < +now() + DAY ? 5 : 0) + (activeGoals.has(task.goalId) ? 4 : 0) + ({ 高: 3, 中: 2, 低: 1 }[task.priority] || 1) + (energy <= 2 && (task.minutes || 25) <= 25 ? 2 : 0);
+    const tasks = store.tasks.filter(task => !task.isDemo && !done(task)).sort((a, b) => score(b) - score(a) || String(a.createdAt).localeCompare(String(b.createdAt))).slice(0, 3);
+    return { tasks, energy, reason: energy <= 2 ? '优先临近截止与目标相关的行动，低精力时倾向短任务。' : '按截止时间、目标关联和优先级排序，每次聚焦最多三件事。' };
+  }
+  function overview() {
+    const tasks = store.tasks.filter(task => !task.isDemo);
+    const start = dayStart(now());
+    const days = Array.from({ length: 7 }, (_, index) => {
+      const date = start - (6 - index) * DAY;
+      return { date: dayKey(date), completed: tasks.filter(task => done(task) && inRange(task.completedAt, date, date + DAY)).length, reading: store.reading.filter(item => inRange(item.createdAt, date, date + DAY)).length };
+    });
+    let streak = 0;
+    const activeDays = new Set([...tasks.filter(done).map(task => task.completedAt).filter(Boolean), ...store.checkins.map(item => item.createdAt)].map(dayKey));
+    let cursor = activeDays.has(dayKey(start)) ? start : start - DAY;
+    while (activeDays.has(dayKey(cursor)) && streak < 36500) { streak++; cursor -= DAY; }
+    return { activeTasks: tasks.filter(task => !done(task)).length, completedToday: days[6].completed, activeGoals: store.goals.filter(goal => goal.status === 'active').length, readingCount: store.reading.length, dueReviews: store.reading.filter(item => !item.nextReviewAt || Date.parse(item.nextReviewAt) <= +now()).length, completionRate: tasks.length ? Math.round(tasks.filter(done).length / tasks.length * 100) : null, streak, days, todayTasks: morning().tasks };
+  }
+  function digest(period, at = now()) {
+    if (!['daily', 'weekly'].includes(period)) throw fail('整理周期应为 daily 或 weekly');
+    let start = dayStart(at);
+    if (period === 'weekly') start -= ((new Date(start + ZONE).getUTCDay() + 6) % 7) * DAY;
+    const end = start + (period === 'weekly' ? 7 : 1) * DAY;
+    const key = `${period}:${dayKey(start)}`;
+    return mutate(draft => {
+      const completed = draft.tasks.filter(task => !task.isDemo && done(task) && inRange(task.completedAt, start, end));
+      const readings = draft.reading.filter(item => inRange(item.createdAt, start, end));
+      const reviews = draft.reading.flatMap(item => (item.reviews || []).filter(review => inRange(review.createdAt, start, end)).map(review => ({ ...review, sourceId: item.id })));
+      const checkins = draft.checkins.filter(item => inRange(item.createdAt, start, end));
+      const highlights = completed.map(task => ({ text: task.title, sourceId: task.id, evidence: task.evidence || '' }));
+      const actionItems = morning().tasks.map(task => ({ title: task.title, reason: task.goalId ? '推进关联目标' : '完成现有承诺', sourceIds: [task.id], taskId: task.id }));
+      if (actionItems.length < 3 && readings.length) actionItems.push({ title: `应用《${readings[0].title}》中的一个观点，写下实践结果`, reason: '让阅读形成实际产出', sourceIds: [readings[0].id], sourceType: 'reading' });
+      const stats = { completedTasks: completed.length, evidenceTasks: completed.filter(task => text(task.evidence)).length, readingAdded: readings.length, reviews: reviews.length, checkins: checkins.length, averageEnergy: checkins.length ? Number((checkins.reduce((sum, item) => sum + item.energy, 0) / checkins.length).toFixed(1)) : null };
+      const markdown = [`# ${dayKey(start)} ${period === 'weekly' ? '周复盘' : '日复盘'}`, '', `周期：${dayKey(start)} 至 ${dayKey(end - 1)}（Asia/Shanghai）`, `生成时间：${stamp()}；当前周期数据随重新生成更新。`, '', '## 实际进展', `- 已完成行动：${stats.completedTasks}（有证据 ${stats.evidenceTasks}）`, `- 新增阅读：${stats.readingAdded}；复习：${stats.reviews} 次`, `- 精力：${stats.averageEnergy === null ? '尚未记录' : `${stats.averageEnergy}/5`}；签到 ${stats.checkins} 次`, '', '## 完成证据', ...(highlights.length ? highlights.map(item => `- ${item.text}\n  - 证据：${item.evidence || '旧记录未提供'}\n  - 来源：${item.sourceId}`) : ['本周期尚无已完成行动。']), '', '## 阅读与思考', ...(readings.length ? readings.map(item => `- 《${item.title}》：${(item.note || item.quote || '待补充自己的理解').slice(0, 400)}\n  - 来源：${item.id}`) : ['本周期没有新增阅读记录。']), '', '## 阻碍与调整', ...(checkins.length ? checkins.map(item => `- ${item.note || '已记录精力'}${item.blocker ? `；阻碍：${item.blocker}` : ''}${item.tomorrow ? `；下一步：${item.tomorrow}` : ''}`) : ['尚未记录，可用一次简短签到补充。']), '', '## 下一步', ...actionItems.map(item => `- [ ] ${item.title}（${item.reason}；来源：${item.sourceIds.join(', ')}）`), '', '> 本报告由本地规则整理，不代表 AI 已验证或知识已掌握。'].join('\n');
+      const previous = draft.digests.find(item => item.periodKey === key);
+      const report = { id: previous?.id || id(), period, periodKey: key, periodStart: new Date(start).toISOString(), periodEnd: new Date(end).toISOString(), createdAt: previous?.createdAt || stamp(), updatedAt: stamp(), markdown, stats, highlights, actionItems, sourceIds: [...new Set([...completed, ...readings, ...checkins].map(item => item.id).concat(reviews.map(item => item.sourceId)))] };
+      if (previous) draft.digests[draft.digests.indexOf(previous)] = report; else draft.digests.unshift(report);
+      event(draft, 'digest.generated', report.id); return report;
+    });
+  }
+  let ticking = false;
+  function tick({ manual = false } = {}) {
+    if (!store.automation.enabled || ticking) return { skipped: true, reason: ticking ? '任务正在运行' : '自动整理未开启' };
+    ticking = true;
+    const results = [];
+    try {
+      const auto = store.automation;
+      const start = dayStart(now());
+      let daily = start + auto.dailyHour * 3600000;
+      if (daily > +now()) daily -= DAY;
+      let weekly = start - ((new Date(start + ZONE).getUTCDay() - auto.weeklyDay + 7) % 7) * DAY + auto.weeklyHour * 3600000;
+      if (weekly > +now()) weekly -= 7 * DAY;
+      for (const [period, scheduledAt] of [['daily', daily], ['weekly', weekly]]) {
+        const runKey = `${period}:${dayKey(scheduledAt)}`;
+        const runs = store.runs.filter(run => run.key === runKey);
+        if (runs.some(run => run.status === 'success') || (!manual && runs.length >= 3)) continue;
+        const last = runs[runs.length - 1];
+        if (!manual && last && +now() - Date.parse(last.createdAt) < runs.length * 60000) continue;
+        const runId = id();
+        mutate(draft => draft.runs.push({ id: runId, key: runKey, type: period, status: 'running', attempt: runs.length + 1, scheduledAt: new Date(scheduledAt).toISOString(), createdAt: stamp() }));
+        try {
+          const warnings = [];
+          if (auto.autoImport) {
+            const incoming = integrations.readVault();
+            const result = importReading(incoming.items, 'obsidian');
+            warnings.push(...(incoming.warnings || []), ...result.errors.map(error => `记录 ${error.index + 1}：${error.message}`));
+          }
+          const report = digest(period, new Date(scheduledAt));
+          mutate(draft => {
+            Object.assign(lookup(draft, 'runs', runId), { status: 'success', digestId: report.id, warnings, finishedAt: stamp() });
+            draft.automation[period === 'daily' ? 'lastDailyRunDate' : 'lastWeeklyRunDate'] = dayKey(scheduledAt);
+          });
+          results.push({ period, status: 'success', digestId: report.id, warnings });
+        } catch (error) {
+          const message = error.statusCode ? error.message : '本次整理失败，请检查数据目录权限';
+          mutate(draft => Object.assign(lookup(draft, 'runs', runId), { status: 'failed', error: message, finishedAt: stamp() }));
+          results.push({ period, status: 'failed', error: message });
+        }
+      }
+      return { runs: results };
+    } finally { ticking = false; }
+  }
+  if (store.runs.some(run => run.status === 'running')) mutate(draft => draft.runs.forEach(run => {
+    if (run.status === 'running') Object.assign(run, { status: 'failed', error: '上次服务中断，将按重试策略恢复', finishedAt: stamp() });
+  }));
+  function readBody(req) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let bytes = 0;
+      req.on('data', chunk => { bytes += chunk.length; if (bytes <= 1024 * 1024) chunks.push(chunk); });
+      req.on('end', () => {
+        if (bytes > 1024 * 1024) return reject(fail('请求超过 1 MB，请分批导入', 413));
+        try {
+          const parsed = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw fail('请求应为 JSON 对象');
+          resolve(parsed);
+        } catch { reject(fail('请求 JSON 格式无效')); }
+      });
+      req.on('error', reject);
+    });
+  }
+  function send(res, status, value) {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    res.end(JSON.stringify(value));
+  }
+  async function api(req, res, url) {
+    const route = url.pathname, method = req.method;
+    const write = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method);
+    if (write) {
+      if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) throw fail('写入请求需要 application/json', 415);
+      if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) throw fail('不允许跨站写入', 403);
+      if (req.headers['sec-fetch-site'] === 'cross-site') throw fail('不允许跨站写入', 403);
+    }
+    const body = write ? await readBody(req) : {};
+    if (method === 'GET' && route === '/api/health') return { ok: true, version: '0.2.0', schemaVersion: 3, timezone: 'Asia/Shanghai' };
+    if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), integrations: integrations.status() };
+    if (method === 'GET' && route === '/api/overview') return overview();
+    if (method === 'GET' && route === '/api/morning') return morning();
+    if (method === 'GET' && route === '/api/export') { res.setHeader('Content-Disposition', 'attachment; filename="personal-court-backup.json"'); return store; }
+    for (const list of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'events', 'runs']) {
+      if (method === 'GET' && route === `/api/${list}`) return store[list].filter(item => !url.searchParams.get('dept') || item.dept === url.searchParams.get('dept')).filter(item => !url.searchParams.get('status') || item.status === url.searchParams.get('status'));
+    }
+    if (method === 'POST' && route === '/api/tasks') return { task: mutate(draft => newTask(draft, body)) };
+    let match = route.match(/^\/api\/tasks\/([^/]+)$/);
+    if (method === 'PATCH' && match) return { task: mutate(draft => {
+      const task = lookup(draft, 'tasks', match[1]);
+      if (body.title !== undefined) task.title = required(body.title, '行动标题');
+      if (body.evidence !== undefined) task.evidence = text(body.evidence, 4000);
+      if (done(task) && body.status === undefined && !text(task.evidence)) throw fail('已完成行动需要保留完成证据');
+      if (body.dueAt !== undefined) task.dueAt = dateValue(body.dueAt);
+      if (body.goalId !== undefined) { if (body.goalId) lookup(draft, 'goals', body.goalId); task.goalId = text(body.goalId); }
+      if (body.status !== undefined) {
+        const status = taskStatus(body.status);
+        if (status === '已完成' && !text(task.evidence)) throw fail('请记录完成证据：做出了什么、如何验证');
+        if (status === '已完成' && !done(task)) { task.completedAt = stamp(); event(draft, 'task.completed', task.id); }
+        if (status !== '已完成') task.completedAt = null;
+        task.status = status;
+      }
+      task.updatedAt = stamp(); return task;
+    }) };
+    if (method === 'POST' && route === '/api/goals') return { goal: mutate(draft => {
+      const goal = { id: id(), title: required(body.title, '目标'), why: text(body.why), targetDate: dateValue(body.targetDate), status: 'active', createdAt: stamp() };
+      draft.goals.push(goal); event(draft, 'goal.created', goal.id); return goal;
+    }) };
+    match = route.match(/^\/api\/goals\/([^/]+)$/);
+    if (method === 'PATCH' && match) return { goal: mutate(draft => {
+      const goal = lookup(draft, 'goals', match[1]);
+      if (!['active', 'completed'].includes(body.status)) throw fail('目标状态无效');
+      goal.status = body.status; goal.updatedAt = stamp(); return goal;
+    }) };
+    if (method === 'POST' && route === '/api/petitions') return { petition: mutate(draft => {
+      const petition = { id: id(), title: required(body.title, '想法标题'), note: text(body.note, 10000), status: '待澄清', createdAt: stamp() };
+      draft.petitions.push(petition); event(draft, 'capture.created', petition.id); return petition;
+    }) };
+    match = route.match(/^\/api\/petitions\/([^/]+)\/convert$/);
+    if (method === 'POST' && match) return { task: mutate(draft => {
+      const petition = lookup(draft, 'petitions', match[1]);
+      const task = newTask(draft, { title: petition.title }, { sourceType: 'petition', sourceId: petition.id });
+      petition.status = '已转行动'; petition.taskId = task.id; return task;
+    }) };
+    if (method === 'POST' && route === '/api/checkins') return { checkin: mutate(draft => {
+      const energy = Number(body.energy);
+      if (!Number.isInteger(energy) || energy < 1 || energy > 5) throw fail('精力评分应为 1–5');
+      const checkin = { id: id(), energy, note: text(body.note), blocker: text(body.blocker), tomorrow: text(body.tomorrow), createdAt: stamp() };
+      draft.checkins.push(checkin); event(draft, 'checkin.created', checkin.id); return checkin;
+    }) };
+    if (method === 'POST' && ['/api/reading/import', '/api/integrations/wechat-reading/import'].includes(route)) return importReading(parseReading(body), text(body.source, 60) || (route.includes('wechat-reading') ? 'wechat_reading' : 'manual'));
+    match = route.match(/^\/api\/reading\/([^/]+)\/(review|task)$/);
+    if (method === 'POST' && match) return mutate(draft => {
+      const item = lookup(draft, 'reading', match[1]);
+      if (match[2] === 'task') return { task: newTask(draft, { title: body.title || `应用《${item.title}》中的一个观点` }, { sourceType: 'reading', sourceId: item.id }) };
+      if (!['again', 'good'].includes(body.rating)) throw fail('复习反馈应为 again 或 good');
+      const answer = required(body.answer, '自己的回忆内容或遗忘之处', 4000);
+      const steps = [1, 3, 7, 14, 30], step = body.rating === 'again' ? 0 : Math.min(item.reviewStep || 0, steps.length - 1);
+      item.nextReviewAt = new Date(+now() + (body.rating === 'again' ? 10 * 60000 : steps[step] * DAY)).toISOString();
+      item.reviewStep = body.rating === 'again' ? 0 : Math.min(step + 1, steps.length - 1);
+      item.reviewCount = (item.reviewCount || 0) + 1;
+      item.reviews = [...(item.reviews || []), { id: id(), rating: body.rating, answer, createdAt: stamp() }];
+      item.updatedAt = stamp(); event(draft, 'reading.reviewed', item.id); return { reading: item };
+    });
+    if (method === 'POST' && route === '/api/organize/run') return { digest: digest(body.period || 'daily') };
+    match = route.match(/^\/api\/digests\/([^/]+)\/actions\/(\d+)$/);
+    if (method === 'POST' && match) return { task: mutate(draft => {
+      const report = lookup(draft, 'digests', match[1]), action = report.actionItems?.[Number(match[2])];
+      if (!action) throw fail('建议不存在', 404);
+      if (action.taskId) return lookup(draft, 'tasks', action.taskId);
+      const task = newTask(draft, { title: action.title }, { sourceType: 'digest', sourceId: `${report.id}:${hash(action.title)}`, sourceIds: action.sourceIds });
+      action.taskId = task.id; return task;
+    }) };
+    if (method === 'POST' && route === '/api/settings') return { settings: mutate(draft => { draft.settings = validateSettings(draft.settings, body); return draft.settings; }) };
+    if (method === 'GET' && route === '/api/automation/config') return store.automation;
+    if (method === 'PATCH' && route === '/api/automation/config') return { automation: mutate(draft => {
+      for (const field of ['dailyHour', 'weeklyDay', 'weeklyHour']) if (body[field] !== undefined) {
+        const value = Number(body[field]);
+        if (!Number.isInteger(value) || value < 0 || value > (field === 'weeklyDay' ? 6 : 23)) throw fail('调度时间无效');
+        draft.automation[field] = value;
+      }
+      for (const field of ['enabled', 'autoImport']) if (body[field] !== undefined) {
+        if (typeof body[field] !== 'boolean') throw fail('开关应为布尔值');
+        draft.automation[field] = body[field];
+      }
+      return draft.automation;
+    }) };
+    if (method === 'POST' && route === '/api/automation/tick') return tick({ manual: true });
+    if (method === 'GET' && route === '/api/obsidian/status') return integrations.status();
+    if (method === 'POST' && route === '/api/obsidian/import') {
+      const incoming = integrations.readVault();
+      return { ...importReading(incoming.items, 'obsidian'), warnings: incoming.warnings || [] };
+    }
+    if (method === 'POST' && route === '/api/obsidian/preview') return integrations.preview();
+    if (method === 'POST' && route === '/api/obsidian/export') {
+      const result = integrations.exportVault(body);
+      mutate(draft => { draft.integrations.obsidian = { ...draft.integrations.obsidian, lastExportAt: stamp(), lastExportFiles: result.files || [] }; event(draft, 'obsidian.exported', '', '本地 Markdown 导出'); });
+      return result;
+    }
+    if (method === 'POST' && route === '/api/ai/preview') return integrations.aiPreview(body);
+    if (method === 'POST' && route === '/api/ai/run') {
+      const result = await integrations.analyze(body);
+      const analysis = { ...result, id: id(), question: text(body.question), createdAt: stamp() };
+      mutate(draft => { draft.aiAnalyses.unshift(analysis); draft.aiAnalyses = draft.aiAnalyses.slice(0, 50); event(draft, 'ai.analyzed', analysis.id); });
+      return { analysis };
+    }
+    if (route === '/api/reset') throw fail('已停用重置接口，请使用数据导出备份', 410);
+    throw fail('接口不存在', 404);
+  }
+  const server = http.createServer(async (req, res) => {
+    try {
+      const host = req.headers.host || '';
+      if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(host)) throw fail('仅允许本机访问', 403);
+      const url = new URL(req.url, `http://${host}`);
+      if (url.pathname.startsWith('/api/')) { const result = await api(req, res, url); if (!res.writableEnded) send(res, 200, result); return; }
+      if (req.method !== 'GET' && req.method !== 'HEAD') throw fail('请求方法不支持', 405);
+      const dist = path.join(__dirname, 'dist');
+      const file = path.resolve(dist, `.${decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname)}`);
+      if (!file.startsWith(dist + path.sep)) throw fail('路径无效', 403);
+      if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw fail('页面不存在', 404);
+      const contentType = ({ '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'application/javascript', '.svg': 'image/svg+xml', '.png': 'image/png' })[path.extname(file)] || 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'" });
+      if (req.method === 'HEAD') res.end(); else fs.createReadStream(file).pipe(res);
+    } catch (error) { send(res, error.statusCode || 500, { error: error.statusCode ? error.message : '操作失败，请检查本地服务或数据目录权限' }); }
   });
-});
-
-const automationTimer = setInterval(checkAutomationSchedule, 60 * 1000);
-automationTimer.unref();
-checkAutomationSchedule();
-
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`个人朝廷 OS 已启动：http://127.0.0.1:${PORT}`);
-  console.log(`数据文件：${STORE_FILE}`);
-});
-
-process.on('SIGINT', () => server.close(() => process.exit(0)));
+  server.requestTimeout = 35000;
+  let timer;
+  if (options.schedule !== false) {
+    timer = setInterval(() => { try { tick(); } catch { console.error('自动整理执行失败，请检查数据目录权限'); } }, 60000);
+    timer.unref();
+    server.once('listening', () => { try { tick(); } catch { console.error('启动补跑失败，请在运行记录中检查'); } });
+  }
+  const close = () => new Promise(resolve => {
+    clearInterval(timer);
+    if (server.listening) { server.close(() => { release(); resolve(); }); server.closeIdleConnections?.(); }
+    else { release(); resolve(); }
+  });
+  return { server, close, tick, getStore: () => structuredClone(store), dataDir };
+}
+if (require.main === module) {
+  try {
+    const app = createApp(), port = Number(process.env.PORT || 3000);
+    app.server.on('error', async error => { console.error(error.code === 'EADDRINUSE' ? '端口已被占用，请更换 PORT 或停止原服务' : '服务启动失败'); await app.close(); process.exitCode = 1; });
+    app.server.listen(port, '127.0.0.1', () => console.log(`个人朝廷 OS：http://127.0.0.1:${port}`));
+    let closing = false;
+    for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { if (closing) return; closing = true; await app.close(); process.exit(0); });
+  } catch (error) { console.error(error.statusCode ? error.message : '服务启动失败，请检查数据目录权限'); process.exitCode = 1; }
+}
+module.exports = { createApp, dayKey, dayStart };

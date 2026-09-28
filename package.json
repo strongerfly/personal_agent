@@ -1,10 +1,13 @@
 {
   "name": "personal-court-os",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "个人朝廷 OS 本地可运行系统",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
-  }
+    "dev": "node --watch server.js",
+    "test": "node test/system.test.js",
+    "start:supervised": "powershell -NoProfile -File scripts/run.ps1 -Supervise"
+  },
+  "engines": { "node": ">=18" }
 }
