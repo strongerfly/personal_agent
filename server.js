@@ -3,6 +3,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const http = require('node:http');
 const { createIntegrations, validateSettings } = require('./lib/integrations');
+const growth = require('./lib/growth');
 
 const DAY = 86400000;
 const ZONE = 8 * 3600000;
@@ -53,7 +54,7 @@ function priorityValue(value = '中') {
 }
 function freshStore() {
   return {
-    schemaVersion: 4, tasks: [], petitions: [], reading: [], digests: [], goals: [], checkins: [], runs: [], events: [], aiAnalyses: [], proposals: [],
+    schemaVersion: 5, tasks: [], petitions: [], reading: [], digests: [], goals: [], checkins: [], runs: [], events: [], aiAnalyses: [], proposals: [], growthAssessments: [], thinkingCases: [], growthExperiments: [],
     settings: { vaultPath: '', readingFolder: 'WeRead', ai: { enabled: false, baseUrl: '', model: '' } },
     automation: { enabled: false, dailyHour: 21, weeklyDay: 0, weeklyHour: 21, autoImport: false, timezone: 'Asia/Shanghai', lastDailyRunDate: null, lastWeeklyRunDate: null },
     integrations: { obsidian: { lastExportAt: null, lastExportFiles: [] } }
@@ -62,10 +63,10 @@ function freshStore() {
 function migrate(parsed) {
   if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw fail('数据文件结构无效，原文件已保留', 500);
   const base = freshStore();
-  for (const key of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'runs', 'events', 'aiAnalyses', 'proposals']) {
+  for (const key of ['tasks', 'petitions', 'reading', 'digests', 'goals', 'checkins', 'runs', 'events', 'aiAnalyses', 'proposals', 'growthAssessments', 'thinkingCases', 'growthExperiments']) {
     if (parsed[key] !== undefined && !Array.isArray(parsed[key])) throw fail(`数据字段 ${key} 无效，原文件已保留`, 500);
   }
-  const result = { ...base, ...parsed, schemaVersion: 4 };
+  const result = { ...base, ...parsed, schemaVersion: 5 };
   result.settings = { ...base.settings, ...parsed.settings, ai: { ...base.settings.ai, ...parsed.settings?.ai } };
   result.automation = { ...base.automation, ...parsed.automation, timezone: 'Asia/Shanghai' };
   result.integrations = { ...base.integrations, ...parsed.integrations };
@@ -157,6 +158,9 @@ function createApp(options = {}) {
       awaitingAcceptance: store.proposals.filter(proposal => proposal.status === 'executing' && proposal.taskIds.length && proposal.taskIds.every(taskId => realTasks.some(task => task.id === taskId && done(task) && text(task.evidence)))).length
     };
   }
+  function growthState() {
+    return { ...growth.growthOverview(store, stamp()), dueExperiments: store.growthExperiments.filter(item => item.status !== 'reviewed' && Date.parse(item.reviewAt) <= +now()).map(item => ({ id: item.id, title: item.title, reviewAt: item.reviewAt, status: item.status, taskId: item.taskId })) };
+  }
   function proposalFields(draft, body, existing = null) {
     const field = (key, fallback) => body[key] === undefined ? (existing?.[key] ?? fallback) : body[key];
     const goalId = text(field('goalId', ''));
@@ -179,9 +183,9 @@ function createApp(options = {}) {
     proposal.history.push({ id: id(), stage, action, note: text(note, 4000), revision: proposal.revision, createdAt: stamp() });
     event(draft, `court.${action}`, proposal.id, stage);
   }
-  function assertRevision(proposal, revision) {
-    if (!Number.isInteger(revision) || revision < 1) throw fail('请提供有效的公文版本 revision');
-    if (proposal.revision !== revision) throw fail('公文版本已更新，请刷新后重新查看与操作', 409);
+  function assertRevision(record, revision) {
+    if (!Number.isInteger(revision) || revision < 1) throw fail('请提供有效的记录版本 revision');
+    if (record.revision !== revision) throw fail('记录版本已更新，请刷新后重新查看与操作', 409);
   }
   function assertPlanComplete(proposal) {
     required(proposal.intent, '拟案目的', 4000);
@@ -272,7 +276,13 @@ function createApp(options = {}) {
       const stats = { completedTasks: completed.length, evidenceTasks: completed.filter(task => text(task.evidence)).length, readingAdded: readings.length, reviews: reviews.length, checkins: checkins.length, averageEnergy: checkins.length ? Number((checkins.reduce((sum, item) => sum + item.energy, 0) / checkins.length).toFixed(1)) : null };
       const markdown = [`# ${dayKey(start)} ${period === 'weekly' ? '周复盘' : '日复盘'}`, '', `周期：${dayKey(start)} 至 ${dayKey(end - 1)}（Asia/Shanghai）`, `生成时间：${stamp()}；当前周期数据随重新生成更新。`, '', '## 实际进展', `- 已完成行动：${stats.completedTasks}（有证据 ${stats.evidenceTasks}）`, `- 新增阅读：${stats.readingAdded}；复习：${stats.reviews} 次`, `- 精力：${stats.averageEnergy === null ? '尚未记录' : `${stats.averageEnergy}/5`}；签到 ${stats.checkins} 次`, '', '## 完成证据', ...(highlights.length ? highlights.map(item => `- ${item.text}\n  - 证据：${item.evidence || '旧记录未提供'}\n  - 来源：${item.sourceId}`) : ['本周期尚无已完成行动。']), '', '## 阅读与思考', ...(readings.length ? readings.map(item => `- 《${item.title}》：${(item.note || item.quote || '待补充自己的理解').slice(0, 400)}\n  - 来源：${item.id}`) : ['本周期没有新增阅读记录。']), '', '## 阻碍与调整', ...(checkins.length ? checkins.map(item => `- ${item.note || '已记录精力'}${item.blocker ? `；阻碍：${item.blocker}` : ''}${item.tomorrow ? `；下一步：${item.tomorrow}` : ''}`) : ['尚未记录，可用一次简短签到补充。']), '', '## 下一步', ...actionItems.map(item => `- [ ] ${item.title}（${item.reason}；来源：${item.sourceIds.join(', ')}）`), '', '> 本报告由本地规则整理，不代表 AI 已验证或知识已掌握。'].join('\n');
       const previous = draft.digests.find(item => item.periodKey === key);
+      const experimentReviews = draft.growthExperiments.flatMap(experiment => experiment.reviews.filter(review => inRange(review.createdAt, start, end)).map(review => ({ experiment, review })));
+      const dueExperiments = draft.growthExperiments.filter(experiment => experiment.status !== 'reviewed' && Date.parse(experiment.reviewAt) <= +at);
+      stats.experimentsReviewed = experimentReviews.length;
+      stats.experimentsDue = dueExperiments.length;
       const report = { id: previous?.id || id(), period, periodKey: key, periodStart: new Date(start).toISOString(), periodEnd: new Date(end).toISOString(), createdAt: previous?.createdAt || stamp(), updatedAt: stamp(), markdown, stats, highlights, actionItems, sourceIds: [...new Set([...completed, ...readings, ...checkins].map(item => item.id).concat(reviews.map(item => item.sourceId)))] };
+      report.markdown += ['','', '## 成长实验与策略修订', ...(experimentReviews.length ? experimentReviews.map(({ experiment, review }) => `- ${experiment.title}：${({ keep: '保留', adjust: '调整', stop: '停止' })[review.decision]}\n  - 观察：${review.observation}\n  - 经验与边界：${review.lesson}\n  - 下一步：${review.adjustment}\n  - 来源：${experiment.id} / ${review.evidence.taskId}`) : ['本周期尚无已复盘实验。']), '', '## 到期实验提醒', ...(dueExperiments.length ? dueExperiments.map(experiment => `- ${experiment.title}（${experiment.status === 'planned' ? '尚未启动' : '等待完成证据与复盘'}；复查日期 ${dayKey(experiment.reviewAt)}；来源：${experiment.id}）`) : ['当前没有到期实验。']), '', '> 策略来自实际复盘与本人判断，需保留适用条件；一次实验不能证明普遍因果。'].join('\n');
+      report.sourceIds = [...new Set([...report.sourceIds, ...experimentReviews.map(item => item.experiment.id), ...dueExperiments.map(item => item.id)])];
       if (previous) draft.digests[draft.digests.indexOf(previous)] = report; else draft.digests.unshift(report);
       event(draft, 'digest.generated', report.id); return report;
     });
@@ -351,8 +361,84 @@ function createApp(options = {}) {
       if (req.headers['sec-fetch-site'] === 'cross-site') throw fail('不允许跨站写入', 403);
     }
     const body = write ? await readBody(req) : {};
-    if (method === 'GET' && route === '/api/health') return { ok: true, version: '0.3.0', schemaVersion: 4, timezone: 'Asia/Shanghai' };
-    if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), court: courtOverview(), integrations: integrations.status() };
+    if (method === 'GET' && route === '/api/health') return { ok: true, version: '0.4.0', schemaVersion: 5, timezone: 'Asia/Shanghai' };
+    if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), court: courtOverview(), growth: growthState(), integrations: integrations.status() };
+    if (method === 'GET' && route === '/api/growth') return growthState();
+    if (method === 'POST' && route === '/api/growth/assessments') return { assessment: mutate(draft => {
+      const assessment = { id: id(), ...growth.assessmentFields(draft, body), createdAt: stamp() };
+      draft.growthAssessments.unshift(assessment); event(draft, 'growth.assessed', assessment.id); return assessment;
+    }) };
+    if (method === 'POST' && route === '/api/thinking/cases') return { thinkingCase: mutate(draft => {
+      const thinkingCase = { id: id(), ...growth.caseFields(draft, body), revision: 1, aiHistory: [], reflections: [], createdAt: stamp(), updatedAt: stamp() };
+      thinkingCase.analysis = growth.buildLocalAnalysis(thinkingCase);
+      draft.thinkingCases.unshift(thinkingCase); event(draft, 'thinking.created', thinkingCase.id); return thinkingCase;
+    }) };
+    let growthMatch = route.match(/^\/api\/thinking\/cases\/([^/]+)(?:\/(?:ai\/(preview|run)|(reflect)))?$/);
+    if (growthMatch) {
+      const caseId = growthMatch[1], action = growthMatch[2] || growthMatch[3];
+      if (method === 'GET' && !action) return { thinkingCase: lookup(store, 'thinkingCases', caseId) };
+      if (method === 'PATCH' && !action) return { thinkingCase: mutate(draft => {
+        const thinkingCase = lookup(draft, 'thinkingCases', caseId);
+        assertRevision(thinkingCase, body.revision);
+        const fields = growth.caseFields(draft, body, thinkingCase);
+        if (thinkingCase.analysis?.mode === 'ai') thinkingCase.aiHistory.unshift({ ...thinkingCase.analysis, caseRevision: thinkingCase.analysis.caseRevision ?? thinkingCase.revision });
+        Object.assign(thinkingCase, fields, { revision: thinkingCase.revision + 1, updatedAt: stamp() });
+        thinkingCase.analysis = growth.buildLocalAnalysis(thinkingCase);
+        event(draft, 'thinking.revised', caseId); return thinkingCase;
+      }) };
+      if (method === 'POST' && action) {
+        const thinkingCase = structuredClone(lookup(store, 'thinkingCases', caseId));
+        assertRevision(thinkingCase, body.revision);
+        if (action === 'reflect') return { thinkingCase: mutate(draft => {
+          const current = lookup(draft, 'thinkingCases', caseId);
+          const notes = {};
+          for (const [key, label] of Object.entries({ claim: '当前论点', counterargument: '最强反方', causalExplanation: '因果机制假说', alternative: '替代解释', test: '区分性检验', conclusion: '暂定结论' })) {
+            if (typeof body[key] !== 'string' || body[key].length > 4000) throw fail(`${label}需为不超过4000字的文本`);
+            notes[key] = required(body[key], label, 4000);
+          }
+          if (current.analysis?.mode === 'ai') current.aiHistory.unshift({ ...current.analysis, caseRevision: current.analysis.caseRevision ?? current.revision });
+          current.reflections = [{ id: id(), ...notes, caseRevision: current.revision, createdAt: stamp() }, ...(current.reflections || [])];
+          current.revision++; current.updatedAt = stamp(); current.analysis = growth.buildLocalAnalysis(current);
+          event(draft, 'thinking.reflected', caseId); return current;
+        }) };
+        if (action === 'preview') return integrations.aiPreview({}, thinkingCase);
+        const analysis = await integrations.analyze(body, thinkingCase);
+        return { thinkingCase: mutate(draft => {
+          const current = lookup(draft, 'thinkingCases', caseId);
+          assertRevision(current, thinkingCase.revision);
+          if (current.analysis?.mode === 'ai') current.aiHistory.unshift({ ...current.analysis, caseRevision: current.analysis.caseRevision ?? current.revision });
+          current.analysis = { ...analysis, mode: 'ai', caseRevision: current.revision };
+          current.revision++; current.updatedAt = stamp();
+          event(draft, 'thinking.analyzed', caseId); return current;
+        }) };
+      }
+    }
+    if (method === 'POST' && route === '/api/growth/experiments') return { experiment: mutate(draft => {
+      const experiment = { id: id(), ...growth.experimentFields(draft, body), revision: 1, status: 'planned', taskId: '', reviews: [], createdAt: stamp(), updatedAt: stamp() };
+      draft.growthExperiments.unshift(experiment); event(draft, 'experiment.created', experiment.id); return experiment;
+    }) };
+    growthMatch = route.match(/^\/api\/growth\/experiments\/([^/]+)\/(start|review)$/);
+    if (method === 'POST' && growthMatch) {
+      const experimentId = growthMatch[1], action = growthMatch[2], current = lookup(store, 'growthExperiments', experimentId);
+      if (action === 'start' && current.taskId) return { experiment: current, task: lookup(store, 'tasks', current.taskId) };
+      return mutate(draft => {
+        const experiment = lookup(draft, 'growthExperiments', experimentId);
+        assertRevision(experiment, body.revision);
+        if (action === 'start') {
+          if (experiment.status !== 'planned') throw fail('只有待开始的实验可以启动', 409);
+          const dept = ({ reasoning: '刑部', learning: '礼部', execution: '兵部', strategy: '户部', expression: '吏部', reflection: '刑部' })[experiment.dimension];
+          const task = newTask(draft, { title: experiment.intervention.slice(0, 300), dept, dueAt: experiment.reviewAt, minutes: experiment.minutes }, { sourceType: 'experiment', sourceId: experiment.id, experimentId: experiment.id, acceptance: `${experiment.metric}；基线：${experiment.baseline}；预期：${experiment.target}` });
+          experiment.taskId = task.id; experiment.status = 'running'; experiment.revision++; experiment.updatedAt = stamp();
+          event(draft, 'experiment.started', experiment.id); return { experiment, task };
+        }
+        if (experiment.status !== 'running') throw fail('只有进行中的实验可以复盘；已归档记录请新建下一轮', 409);
+        const task = lookup(draft, 'tasks', experiment.taskId);
+        if (!done(task) || !text(task.evidence)) throw fail('请先完成实验行动并记录观察证据，再复盘策略', 409);
+        const review = { id: id(), ...growth.reviewFields(body), evidence: { taskId: task.id, title: task.title, evidence: task.evidence, completedAt: task.completedAt }, createdAt: stamp() };
+        experiment.reviews.push(review); experiment.status = 'reviewed'; experiment.revision++; experiment.updatedAt = stamp();
+        event(draft, 'experiment.reviewed', experiment.id, review.decision); return { experiment };
+      });
+    }
     if (method === 'GET' && route === '/api/court') return courtOverview();
     if (method === 'GET' && route === '/api/overview') return overview();
     if (method === 'GET' && route === '/api/morning') return morning();
@@ -426,6 +512,11 @@ function createApp(options = {}) {
     if (method === 'PATCH' && match) return { task: mutate(draft => {
       const task = lookup(draft, 'tasks', match[1]);
       const beforeStatus = task.status, beforeEvidence = task.evidence;
+      if (task.experimentId) {
+        const experiment = lookup(draft, 'growthExperiments', task.experimentId);
+        if (experiment.status === 'reviewed') throw fail('实验已复盘，行动与观察证据已归档', 409);
+        if (Object.keys(body).some(field => !['status', 'evidence'].includes(field))) throw fail('实验方案已确定，只能更新执行状态与观察证据', 409);
+      }
       if (task.proposalId) {
         const proposal = lookup(draft, 'proposals', task.proposalId);
         if (proposal.status === 'completed') throw fail('计划已验收，行动与证据已归档，不可继续修改', 409);
@@ -451,6 +542,11 @@ function createApp(options = {}) {
         const proposal = lookup(draft, 'proposals', task.proposalId);
         proposal.revision++;
         courtHistory(draft, proposal, task.dept, 'progress', `${task.title}：${task.status}${beforeEvidence !== task.evidence ? '，完成证据已更新' : ''}`);
+      }
+      if (task.experimentId && (beforeStatus !== task.status || beforeEvidence !== task.evidence)) {
+        const experiment = lookup(draft, 'growthExperiments', task.experimentId);
+        experiment.revision++; experiment.updatedAt = stamp();
+        event(draft, 'experiment.progress', experiment.id);
       }
       return task;
     }) };

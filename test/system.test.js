@@ -91,11 +91,11 @@ test('fresh API has empty real data, a working health endpoint, and no destructi
   const f = await fixture(t);
   const health = await ok(f, 'GET', '/api/health');
   assert.equal(health.ok, true);
-  assert.equal(health.schemaVersion, 4);
-  assert.match(health.version, /^0\.3\./);
+  assert.equal(health.schemaVersion, 5);
+  assert.match(health.version, /^0\.4\./);
   assert.equal(health.timezone, 'Asia/Shanghai');
   const state = await ok(f, 'GET', '/api/state');
-  for (const list of ['tasks', 'goals', 'reading', 'petitions', 'digests', 'checkins', 'runs', 'proposals']) assert.deepEqual(state[list], []);
+  for (const list of ['tasks', 'goals', 'reading', 'petitions', 'digests', 'checkins', 'runs', 'proposals', 'growthAssessments', 'thinkingCases', 'growthExperiments']) assert.deepEqual(state[list], []);
   assert.equal(state.overview.activeTasks, 0);
   assert.equal(state.overview.completionRate, null);
   assert.deepEqual((await ok(f, 'GET', '/api/morning')).tasks, []);
@@ -473,7 +473,7 @@ async function rejectedUnchanged(f, method, route, body, expected = [400, 409]) 
   const response = await f.request(method, route, body);
   const allowed = Array.isArray(expected) ? expected : [expected];
   assert(allowed.includes(response.status), `${method} ${route}: expected ${allowed.join('/')}, got ${response.status}: ${JSON.stringify(response.body)}`);
-  assert.deepEqual(await ok(f, 'GET', '/api/export'), before, 'Rejected court mutation must not change records, revisions, or events');
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), before, 'Rejected mutation must not change records, revisions, or events');
   return response;
 }
 
@@ -703,11 +703,475 @@ test('court counts only real work per department and preserves schema-3 data thr
   assert.equal(court.unassignedCount, 1);
   assert.deepEqual((await ok(f, 'GET', '/api/state')).court, court);
   const saved = await ok(f, 'GET', '/api/export');
-  assert.equal(saved.schemaVersion, 4);
+  assert.equal(saved.schemaVersion, 5);
   assert.deepEqual(saved.legacyMetadata, legacy.legacyMetadata);
   assert.deepEqual(saved.reading, legacy.reading);
   assert.equal(saved.proposals.length, 6);
   await f.restart();
   assert.deepEqual(await ok(f, 'GET', '/api/export'), saved);
   assert.deepEqual(await ok(f, 'GET', '/api/court'), court);
+});
+
+const DIMENSION_IDS = ['reasoning', 'learning', 'execution', 'strategy', 'expression', 'reflection'];
+
+function thinkingBody(overrides = {}) {
+  return {
+    title: '为什么读完很多材料，却迟迟没有形成成果？',
+    subjectType: 'self', context: '在工作和学习之间安排有限时间',
+    facts: '本周阅读三次，但只有一次留下实践记录。',
+    assumptions: '可能是学习内容与实际问题联系不够。',
+    question: '下一周怎样验证知识转化的真实阻碍？',
+    lensIds: ['economics', 'confucian', 'critical'], sourceIds: [],
+    ...overrides
+  };
+}
+
+async function thinkingCase(f, overrides = {}) {
+  return (await ok(f, 'POST', '/api/thinking/cases', thinkingBody(overrides))).thinkingCase;
+}
+
+function thinkingReflection(overrides = {}) {
+  return {
+    claim: '实践目标不清晰可能是主要阻碍。', counterargument: '精力不足也可以解释同样的结果。',
+    causalExplanation: '目标不明确导致无法选择练习内容，因而没有输出。', alternative: '睡眠不足可能同时降低阅读理解与执行。',
+    test: '固定学习时段和精力水平，比较有无明确问题的两次阅读。', conclusion: '先保留两个解释，用观察结果更新判断。',
+    ...overrides
+  };
+}
+
+function experimentBody(overrides = {}) {
+  return {
+    title: '每天一次小型知识转化实验', dimension: 'execution',
+    hypothesis: '先确定一个实际问题，会提高阅读转化率。',
+    intervention: '开始阅读前写下一个待解决问题，结束后完成一次实践。',
+    metric: '有实际结果记录的阅读次数', baseline: '上周 1 次', target: '本周至少 3 次',
+    reviewAt: '2026-10-05T01:00:00.000Z', minutes: 25,
+    ...overrides
+  };
+}
+
+function experimentReview(overrides = {}) {
+  return {
+    outcome: 'supported', observation: '进行了三次实践并保留结果。',
+    lesson: '先提问能够减少无目的输入。', adjustment: '继续一周，比较是否仍然有效。', decision: 'keep',
+    ...overrides
+  };
+}
+
+function aiThinkingAnswer(item, overrides = {}) {
+  const sourceId = `case:${item.id}`;
+  return {
+    summary: '当前证据不足以确认原因，先用小规模实验比较解释。',
+    lenses: item.lensIds.map(lensId => ({
+      lensId, claim: '资源分配可能影响知识转化。', counterargument: '也可能是成果定义不清晰。',
+      test: '在相同时间预算下比较两种学习安排。', sourceIds: [sourceId]
+    })),
+    causes: [{ cause: '未设定实际问题', effect: '阅读后缺少成果', mechanism: '难以选择要练习的知识', alternative: '可能受到疲劳影响', test: '记录精力并比较两组阅读安排' }],
+    disagreements: [{ thesis: '应提高执行约束', antithesis: '也应保留自由探索', test: '比较固定实践日与自由探索日的成果' }],
+    unknowns: ['样本数量太少，无法排除偶然性。'],
+    actions: [{ title: '做一次对照实践', reason: '用观察结果区分解释', dimension: 'execution', metric: '实践记录数量' }],
+    citations: [sourceId], ...overrides
+  };
+}
+
+function mockAi(t, handler) {
+  const originalFetch = global.fetch;
+  global.fetch = handler;
+  t.after(() => { global.fetch = originalFetch; delete process.env.PERSONAL_AGENT_AI_KEY; });
+}
+
+async function configureMockAi(f) {
+  await ok(f, 'POST', '/api/settings', { ai: { enabled: true, baseUrl: 'https://thinking-model.invalid/v1', model: 'test-thinking-model' } });
+  process.env.PERSONAL_AGENT_AI_KEY = 'test-placeholder-not-a-real-key';
+}
+
+function aiResponse(answer) {
+  return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(answer) } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+test('growth starts without invented scores and retains separate evidence-based assessment snapshots', async t => {
+  const f = await fixture(t, { clock: () => new Date('2026-09-28T01:00:00.000Z') });
+  const empty = await ok(f, 'GET', '/api/growth');
+  assert.deepEqual(empty.dimensions.map(item => item.id), DIMENSION_IDS);
+  assert.equal(empty.latestAssessment, null);
+  assert.equal(empty.previousAssessment, null);
+  assert.deepEqual(empty.evidence, []);
+  assert.deepEqual(empty.strengths, []);
+  assert.deepEqual(empty.focus, []);
+  assert.deepEqual(empty.strategies, []);
+  assert(empty.dimensions.every(item => !Object.hasOwn(item, 'score') || item.score === null), 'Missing observations must not be displayed as measured scores');
+  assert.deepEqual((await ok(f, 'GET', '/api/state')).growth, empty);
+  const { task } = await ok(f, 'POST', '/api/tasks', { title: '独立完成一次知识实践' });
+  await ok(f, 'PATCH', `/api/tasks/${task.id}`, { status: 'done', evidence: '保存了实际结果与一次失败的原因。' });
+  const withoutRating = await ok(f, 'GET', '/api/growth');
+  assert.equal(withoutRating.latestAssessment, null, 'Task counts must never automatically become ability scores');
+  assert(withoutRating.evidence.some(item => item.id === `task:${task.id}`));
+  const first = (await ok(f, 'POST', '/api/growth/assessments', {
+    context: '本周回顾', ratings: [
+      { dimension: 'execution', score: 4, note: '本周独立完成实践，但复杂任务还需要帮助。', sourceIds: [`task:${task.id}`] },
+      { dimension: 'reflection', score: 2, note: '只有一次复盘，证据有限。', sourceIds: [] }
+    ]
+  })).assessment;
+  assert.equal(first.ratings.length, 2);
+  assert.deepEqual(first.ratings[0].sourceIds, [`task:${task.id}`]);
+  const second = (await ok(f, 'POST', '/api/growth/assessments', {
+    context: '下一次回顾', ratings: [{ dimension: 'reflection', score: 3, note: '能够说清反例，仍需验证。', sourceIds: [`task:${task.id}`] }]
+  })).assessment;
+  const result = await ok(f, 'GET', '/api/growth');
+  assert.equal(result.latestAssessment.id, second.id);
+  assert.equal(result.previousAssessment.id, first.id);
+  assert.equal(first.createdAt, second.createdAt, 'Same-time assessments still have a deterministic latest snapshot');
+  assert.equal((await ok(f, 'GET', '/api/state')).growthAssessments.length, 2);
+  await f.restart();
+  assert.deepEqual(await ok(f, 'GET', '/api/growth'), result);
+});
+
+test('growth rejects invalid scores, duplicate dimensions and missing evidence atomically', async t => {
+  const f = await fixture(t);
+  const rating = { dimension: 'reasoning', score: 3, note: '可以区分已知事实和推测。', sourceIds: [] };
+  const invalidRatings = [
+    [], [{ ...rating, score: 0 }], [{ ...rating, score: 6 }], [{ ...rating, score: 2.5 }], [{ ...rating, score: '3' }],
+    [{ ...rating, dimension: 'invented' }], [{ ...rating, note: '  ' }], [rating, { ...rating, score: 4 }],
+    [{ ...rating, sourceIds: ['task:missing'] }], [{ ...rating, sourceIds: 'task:missing' }]
+  ];
+  for (const ratings of invalidRatings) {
+    await rejectedUnchanged(f, 'POST', '/api/growth/assessments', { context: '拒绝错误评分', ratings }, [400, 404]);
+  }
+  assert.equal((await ok(f, 'GET', '/api/growth')).latestAssessment, null);
+});
+
+test('thinking cases preserve facts versus assumptions and reject stale edits without changing saved analysis', async t => {
+  const f = await fixture(t);
+  let item = await thinkingCase(f);
+  assert.equal(item.revision, 1);
+  assert.equal(item.analysis.mode, 'guided');
+  assert.equal(item.facts, thinkingBody().facts);
+  assert.equal(item.assumptions, thinkingBody().assumptions);
+  assert.deepEqual(item.analysis.lenses.map(lens => lens.lensId).sort(), item.lensIds.slice().sort());
+  assert(item.analysis.lenses.every(lens => lens.claim && lens.counterargument && lens.test));
+  assert(item.analysis.causes.length && item.analysis.disagreements.length && item.analysis.unknowns.length && item.analysis.actions.length);
+  assert.deepEqual(item.aiHistory, []);
+  for (const patch of [
+    { facts: '' }, { question: '' }, { subjectType: 'unknown' }, { lensIds: ['economics', 'critical'] },
+    { lensIds: ['economics', 'critical', 'critical'] }, { lensIds: ['economics', 'critical', 'invented'] },
+    { sourceIds: ['task:does-not-exist'] }
+  ]) await rejectedUnchanged(f, 'POST', '/api/thinking/cases', thinkingBody(patch), [400, 404]);
+  await rejectedUnchanged(f, 'PATCH', `/api/thinking/cases/${item.id}`, { ...thinkingBody(), revision: 0 }, 400);
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { ...thinkingBody({ facts: '补充观察：两次阅读发生在精力较低的晚上。' }), revision: item.revision })).thinkingCase;
+  assert.equal(item.revision, 2);
+  assert.equal(item.analysis.mode, 'guided');
+  await rejectedUnchanged(f, 'PATCH', `/api/thinking/cases/${item.id}`, { ...thinkingBody({ title: '过期编辑' }), revision: 1 }, 409);
+  assert.deepEqual((await ok(f, 'GET', `/api/thinking/cases/${item.id}`)).thinkingCase, item);
+  const reflectRoute = `/api/thinking/cases/${item.id}/reflect`;
+  for (const field of Object.keys(thinkingReflection())) {
+    await rejectedUnchanged(f, 'POST', reflectRoute, { ...thinkingReflection({ [field]: '' }), revision: item.revision }, 400);
+  }
+  const firstReflectionRevision = item.revision;
+  item = (await ok(f, 'POST', reflectRoute, { ...thinkingReflection(), revision: item.revision })).thinkingCase;
+  assert.equal(item.revision, firstReflectionRevision + 1);
+  assert.equal(item.reflections.length, 1);
+  assert.equal(item.reflections[0].caseRevision, firstReflectionRevision);
+  assert.equal(item.reflections[0].claim, thinkingReflection().claim);
+  const firstReflection = item.reflections[0];
+  await rejectedUnchanged(f, 'POST', reflectRoute, { ...thinkingReflection(), revision: firstReflectionRevision }, 409);
+  item = (await ok(f, 'POST', reflectRoute, { ...thinkingReflection({ conclusion: '新增一次观察，仍然需要进一步验证。' }), revision: item.revision })).thinkingCase;
+  assert.equal(item.reflections.length, 2);
+  assert.deepEqual(item.reflections[1], firstReflection);
+  assert.equal(item.analysis.mode, 'guided');
+  await f.restart();
+  assert.deepEqual((await ok(f, 'GET', `/api/thinking/cases/${item.id}`)).thinkingCase, item);
+  assert.equal((await ok(f, 'GET', '/api/tasks')).length, 0, 'Guided recommendations do not execute themselves');
+});
+
+test('thinking AI approval binds exact case, evidence, configuration and expiry before any external call', async t => {
+  const f = await fixture(t);
+  let calls = 0;
+  mockAi(t, async () => { calls++; throw new Error('No provider request should be made in this test'); });
+  const book = await reading(f);
+  let item = await thinkingCase(f, { sourceIds: [`reading:${book.id}`] });
+  const previewRoute = `/api/thinking/cases/${item.id}/ai/preview`;
+  const runRoute = `/api/thinking/cases/${item.id}/ai/run`;
+  assert.equal((await f.request('POST', previewRoute, { revision: item.revision })).status, 412);
+  await configureMockAi(f);
+  let preview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+  assert.equal(preview.destination, 'https://thinking-model.invalid/v1/chat/completions');
+  assert.equal(preview.model, 'test-thinking-model');
+  assert(JSON.stringify(preview.payload).includes(item.facts));
+  assert(JSON.stringify(preview.payload).includes(item.question));
+  assert(!JSON.stringify(preview).includes('test-placeholder-not-a-real-key'));
+  await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: false }, 412);
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { ...thinkingBody({ sourceIds: [`reading:${book.id}`], facts: '观察事实发生变化。' }), revision: item.revision })).thinkingCase;
+  await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
+  preview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+  await reading(f, { note: '预览之后来源笔记改变了。' });
+  await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
+  preview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+  await ok(f, 'POST', '/api/settings', { ai: { enabled: true, baseUrl: 'https://thinking-model.invalid/v1', model: 'other-test-model' } });
+  await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
+  preview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+  item = (await ok(f, 'POST', `/api/thinking/cases/${item.id}/reflect`, { ...thinkingReflection(), revision: item.revision })).thinkingCase;
+  await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
+  preview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+  assert(JSON.stringify(preview.payload).includes(thinkingReflection().conclusion), 'AI disclosure must include the personal reflection that it will analyze');
+  const realDateNow = Date.now;
+  try {
+    Date.now = () => realDateNow() + 60 * 60 * 1000;
+    await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
+  } finally { Date.now = realDateNow; }
+  assert.equal(calls, 0);
+});
+
+test('thinking AI validates competing perspectives and citations, consumes approvals once, and archives revisions', async t => {
+  const f = await fixture(t);
+  let item = await thinkingCase(f);
+  let answer = aiThinkingAnswer(item);
+  let calls = 0;
+  mockAi(t, async (destination, options) => {
+    calls++;
+    assert.equal(destination, 'https://thinking-model.invalid/v1/chat/completions');
+    assert.equal(options.redirect, 'error');
+    assert.equal(options.headers.Authorization, 'Bearer test-placeholder-not-a-real-key');
+    assert(!options.body.includes('test-placeholder-not-a-real-key'));
+    const payload = JSON.parse(options.body);
+    assert.equal(payload.model, 'test-thinking-model');
+    assert(payload.messages[0].content.includes('不可信'));
+    assert(payload.messages[1].content.includes(item.facts));
+    return aiResponse(answer);
+  });
+  await configureMockAi(f);
+  const previewRoute = `/api/thinking/cases/${item.id}/ai/preview`;
+  const runRoute = `/api/thinking/cases/${item.id}/ai/run`;
+  const preview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+  item = (await ok(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true })).thinkingCase;
+  assert.equal(item.revision, 2);
+  assert.equal(item.analysis.mode, 'ai');
+  assert.equal(item.analysis.lenses.length, 3);
+  assert.deepEqual(item.analysis.citations, [`case:${item.id}`]);
+  await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
+  assert.equal(calls, 1);
+  const savedAi = JSON.parse(JSON.stringify(item.analysis));
+  await f.restart();
+  assert.deepEqual((await ok(f, 'GET', `/api/thinking/cases/${item.id}`)).thinkingCase, item);
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { ...thinkingBody({ facts: '新增事实：后续两次实践出现了与原假设相反的结果。', question: '补充问题后重新分析，不沿用旧结论。' }), revision: item.revision })).thinkingCase;
+  assert.equal(item.analysis.mode, 'guided');
+  assert.equal(item.aiHistory.length, 1);
+  assert(JSON.stringify(item.aiHistory[0]).includes(savedAi.summary), 'An edit must retain the previous AI analysis for traceability');
+  assert.equal(item.aiHistory[0].caseRevision, 1, 'Archived analysis keeps its input case revision rather than the newer case revision');
+  assert.deepEqual(item.aiHistory[0].inputSnapshot, preview.payload, 'Archived analysis retains the approved original facts and sources even after the case facts change');
+  const validAnswer = aiThinkingAnswer(item);
+  const invalidAnswers = [
+    { ...validAnswer, citations: ['case:invented'] },
+    { ...validAnswer, lenses: validAnswer.lenses.map((lens, index) => index ? lens : { ...lens, sourceIds: ['task:invented'] }) },
+    { ...validAnswer, lenses: validAnswer.lenses.slice(1) },
+    { ...validAnswer, lenses: [validAnswer.lenses[0], validAnswer.lenses[0], validAnswer.lenses[2]] },
+    { ...validAnswer, lenses: validAnswer.lenses.map((lens, index) => index ? lens : { ...lens, counterargument: '' }) },
+    { ...validAnswer, causes: [] },
+    { ...validAnswer, disagreements: [] },
+    { ...validAnswer, actions: [{ ...validAnswer.actions[0], dimension: 'invented' }] }
+  ];
+  for (answer of invalidAnswers) {
+    const invalidPreview = await ok(f, 'POST', previewRoute, { revision: item.revision });
+    await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: invalidPreview.previewId, approved: true }, 502);
+    const callsAfterRejection = calls;
+    await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: invalidPreview.previewId, approved: true }, 409);
+    assert.equal(calls, callsAfterRejection, 'Rejected provider output still consumes the one-time approval');
+  }
+  assert.equal((await ok(f, 'GET', '/api/tasks')).length, 0);
+});
+
+test('thinking AI cannot overwrite a case edited while a provider request is pending', async t => {
+  const f = await fixture(t);
+  let item = await thinkingCase(f);
+  const original = item;
+  let release;
+  let markStarted;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  mockAi(t, async () => { markStarted(); return new Promise(resolve => { release = () => resolve(aiResponse(aiThinkingAnswer(original))); }); });
+  await configureMockAi(f);
+  const preview = await ok(f, 'POST', `/api/thinking/cases/${item.id}/ai/preview`, { revision: item.revision });
+  const pending = f.request('POST', `/api/thinking/cases/${item.id}/ai/run`, { revision: item.revision, previewId: preview.previewId, approved: true });
+  await Promise.race([started, pending.then(response => { throw new Error(`AI request returned ${response.status} before reaching mocked fetch`); })]);
+  try {
+    item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { ...thinkingBody({ facts: 'AI 分析等待期间增加了决定性反例。' }), revision: item.revision })).thinkingCase;
+    const afterEdit = await ok(f, 'GET', '/api/export');
+    release();
+    assert.equal((await pending).status, 409);
+    assert.deepEqual(await ok(f, 'GET', '/api/export'), afterEdit, 'A late AI answer must not replace a newer case');
+    assert.equal(item.analysis.mode, 'guided');
+  } finally { if (release) release(); }
+});
+
+test('growth experiments create one real task and require observed evidence before retaining or changing strategies', async t => {
+  const current = new Date('2026-10-06T01:00:00.000Z');
+  const f = await fixture(t, { clock: () => current });
+  const item = await thinkingCase(f);
+  for (const patch of [
+    { dimension: 'invented' }, { caseId: 'missing-case' }, { hypothesis: '' }, { intervention: '' },
+    { metric: '' }, { baseline: '' }, { target: '' }, { reviewAt: 'not-a-date' }, { minutes: 0 }, { minutes: 1441 }
+  ]) await rejectedUnchanged(f, 'POST', '/api/growth/experiments', experimentBody(patch), [400, 404]);
+  let experiment = (await ok(f, 'POST', '/api/growth/experiments', experimentBody({ caseId: item.id }))).experiment;
+  assert.equal(experiment.status, 'planned');
+  assert.equal(experiment.revision, 1);
+  assert.deepEqual(experiment.reviews, []);
+  const startRoute = `/api/growth/experiments/${experiment.id}/start`;
+  const reviewRoute = `/api/growth/experiments/${experiment.id}/review`;
+  await rejectedUnchanged(f, 'POST', reviewRoute, { ...experimentReview(), revision: experiment.revision }, 409);
+  await rejectedUnchanged(f, 'POST', startRoute, { revision: 0 }, 400);
+  await rejectedUnchanged(f, 'POST', startRoute, { revision: 2 }, 409);
+  const started = await ok(f, 'POST', startRoute, { revision: experiment.revision });
+  experiment = started.experiment;
+  assert.equal(experiment.status, 'running');
+  assert.equal(experiment.revision, 2);
+  assert.equal(started.task.title, experiment.intervention);
+  assert.notEqual(started.task.isDemo, true);
+  assert.equal(started.task.experimentId, experiment.id);
+  assert.equal(started.task.minutes, 25);
+  for (const patch of [{ title: '悄悄改变实验安排' }, { minutes: 50 }, { dept: '工部' }]) {
+    await rejectedUnchanged(f, 'PATCH', `/api/tasks/${started.task.id}`, patch, 409);
+  }
+  const beforeRepeat = await ok(f, 'GET', '/api/export');
+  const repeated = await ok(f, 'POST', startRoute, { revision: 1 });
+  assert.equal(repeated.task.id, started.task.id);
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), beforeRepeat);
+  await rejectedUnchanged(f, 'POST', reviewRoute, { ...experimentReview(), revision: experiment.revision }, 409);
+  await rejectedUnchanged(f, 'PATCH', `/api/tasks/${started.task.id}`, { status: 'done' }, 400);
+  const evidence = '实践日志：三次学习均有问题、输出与验证结果，仍需更长时间验证。';
+  await ok(f, 'PATCH', `/api/tasks/${started.task.id}`, { status: 'done', evidence });
+  await rejectedUnchanged(f, 'POST', reviewRoute, { ...experimentReview(), revision: experiment.revision }, 409);
+  experiment = (await ok(f, 'GET', '/api/state')).growthExperiments.find(value => value.id === experiment.id);
+  assert(experiment.revision > 2, 'New task evidence must invalidate an older review revision');
+  for (const patch of [{ observation: '' }, { lesson: '' }, { adjustment: '' }, { outcome: 'refuted', decision: 'keep' }, { outcome: 'inconclusive', decision: 'keep' }]) {
+    await rejectedUnchanged(f, 'POST', reviewRoute, { ...experimentReview(patch), revision: experiment.revision }, 400);
+  }
+  await rejectedUnchanged(f, 'POST', reviewRoute, { ...experimentReview(), revision: 1 }, 409);
+  const reviewRevision = experiment.revision;
+  experiment = (await ok(f, 'POST', reviewRoute, { ...experimentReview(), revision: experiment.revision })).experiment;
+  assert.equal(experiment.status, 'reviewed');
+  assert.equal(experiment.revision, reviewRevision + 1);
+  assert.equal(experiment.reviews.length, 1);
+  assert(JSON.stringify(experiment.reviews[0]).includes(evidence), 'Review must snapshot the actual task evidence');
+  const growth = await ok(f, 'GET', '/api/growth');
+  assert.equal(growth.strategies.length, 1);
+  assert(JSON.stringify(growth.strategies[0]).includes(experiment.id), 'Retained strategy must link back to its experiment');
+  for (const patch of [{ status: 'doing' }, { evidence: '复盘后覆盖旧证据' }]) {
+    await rejectedUnchanged(f, 'PATCH', `/api/tasks/${started.task.id}`, patch, 409);
+  }
+  await rejectedUnchanged(f, 'POST', reviewRoute, { ...experimentReview(), revision: experiment.revision }, 409);
+  const saved = await ok(f, 'GET', '/api/export');
+  const repeatAfterReview = await ok(f, 'POST', startRoute, { revision: 1 });
+  assert.equal(repeatAfterReview.task.id, started.task.id);
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), saved);
+  await f.restart();
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), saved);
+  assert.deepEqual((await ok(f, 'GET', '/api/growth')).strategies, growth.strategies);
+});
+
+test('schema-4 migration preserves existing court work and excludes demo records from growth evidence', async t => {
+  const f = await fixture(t, { start: false });
+  const legacy = {
+    schemaVersion: 4, customMetadata: { keep: 'existing extension' },
+    tasks: [
+      { id: 'old-real', title: '真实已完成任务', dept: '礼部', status: '已完成', evidence: '真实执行结果', completedAt: '2026-09-28T01:00:00.000Z' },
+      { id: 'old-demo', title: '演示任务', dept: '工部', status: '已完成', evidence: '虚构完成记录', isDemo: true, completedAt: '2026-09-28T01:00:00.000Z' }
+    ],
+    proposals: [{ id: 'old-proposal', title: '保留旧公文', status: 'draft', revision: 3, steps: [], taskIds: [], history: [] }]
+  };
+  fs.writeFileSync(path.join(f.directory, 'store.json'), JSON.stringify(legacy), 'utf8');
+  await f.start();
+  const exported = await ok(f, 'GET', '/api/export');
+  assert.equal(exported.schemaVersion, 5);
+  assert.deepEqual(exported.tasks, legacy.tasks);
+  assert.deepEqual(exported.proposals, legacy.proposals);
+  assert.deepEqual(exported.customMetadata, legacy.customMetadata);
+  for (const key of ['growthAssessments', 'thinkingCases', 'growthExperiments']) assert.deepEqual(exported[key], []);
+  const growth = await ok(f, 'GET', '/api/growth');
+  assert(growth.evidence.some(item => item.id === 'task:old-real'));
+  assert(!growth.evidence.some(item => item.id === 'task:old-demo'));
+  assert.equal(growth.latestAssessment, null, 'Migration must not turn old task counts into personal capability scores');
+  await rejectedUnchanged(f, 'POST', '/api/growth/assessments', { context: '演示不构成证据', ratings: [{ dimension: 'execution', score: 5, note: '不能基于演示评分', sourceIds: ['task:old-demo'] }] }, [400, 404]);
+  await rejectedUnchanged(f, 'POST', '/api/thinking/cases', thinkingBody({ sourceIds: ['task:old-demo'] }), [400, 404]);
+  await f.restart();
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), exported);
+});
+
+test('unsuccessful growth experiments retain corrective strategies and leave the review queue after review', async t => {
+  const f = await fixture(t, { clock: () => new Date('2026-10-06T01:00:00.000Z') });
+  const expected = [
+    { outcome: 'refuted', decision: 'adjust', title: '未达到预期的学习安排', observation: '增加阅读时间后，实践次数没有增加。', lesson: '时间投入不是唯一瓶颈。', adjustment: '把阅读的一半时间改为反馈和练习。' },
+    { outcome: 'inconclusive', decision: 'stop', title: '证据不足的复杂计划', observation: '本周只有一次记录，无法区分不同解释。', lesson: '当前计划的收集成本太高。', adjustment: '停止当前方案，重新设计低成本观察。' }
+  ];
+  for (const review of expected) {
+    let experiment = (await ok(f, 'POST', '/api/growth/experiments', experimentBody({ title: review.title }))).experiment;
+    assert((await ok(f, 'GET', '/api/growth')).dueExperiments.some(value => value.id === experiment.id));
+    const started = await ok(f, 'POST', `/api/growth/experiments/${experiment.id}/start`, { revision: experiment.revision });
+    await ok(f, 'PATCH', `/api/tasks/${started.task.id}`, { status: 'done', evidence: review.observation });
+    experiment = (await ok(f, 'GET', '/api/state')).growthExperiments.find(value => value.id === experiment.id);
+    await ok(f, 'POST', `/api/growth/experiments/${experiment.id}/review`, { ...review, revision: experiment.revision });
+    const result = await ok(f, 'GET', '/api/growth');
+    assert(!result.dueExperiments.some(value => value.id === experiment.id));
+    const strategy = result.strategies.find(value => value.experimentId === experiment.id);
+    assert.equal(strategy.decision, review.decision);
+    assert.equal(strategy.lesson, review.lesson);
+    assert.equal(strategy.adjustment, review.adjustment);
+  }
+  assert.equal((await ok(f, 'GET', '/api/growth')).strategies.length, 2);
+});
+
+test('growth strategy loop feeds AI disclosure, period reports and conflict-safe Obsidian export', async t => {
+  const f = await fixture(t, { clock: () => new Date('2026-10-06T01:00:00.000Z') });
+  mockAi(t, async () => { throw new Error('Preview must not send an external AI request'); });
+  const vault = path.join(f.directory, 'growth-export-vault');
+  fs.mkdirSync(vault);
+  const rootReadme = '# Existing personal knowledge base\n';
+  fs.writeFileSync(path.join(vault, 'README.md'), rootReadme, 'utf8');
+  await ok(f, 'POST', '/api/settings', { vaultPath: vault });
+  const assessment = (await ok(f, 'POST', '/api/growth/assessments', { context: '为学习实验建立基线', ratings: [{ dimension: 'reflection', score: 2, note: '需要更多真实的反证记录。', sourceIds: [] }] })).assessment;
+  let item = await thinkingCase(f);
+  item = (await ok(f, 'POST', `/api/thinking/cases/${item.id}/reflect`, { ...thinkingReflection(), revision: item.revision })).thinkingCase;
+  let experiment = (await ok(f, 'POST', '/api/growth/experiments', experimentBody({ caseId: item.id }))).experiment;
+  const started = await ok(f, 'POST', `/api/growth/experiments/${experiment.id}/start`, { revision: experiment.revision });
+  const evidence = '真实观察：三次实践都有输出，但两次未获得外部反馈。';
+  await ok(f, 'PATCH', `/api/tasks/${started.task.id}`, { status: 'done', evidence });
+  experiment = (await ok(f, 'GET', '/api/state')).growthExperiments.find(value => value.id === experiment.id);
+  const review = experimentReview({ outcome: 'inconclusive', decision: 'adjust', observation: evidence, lesson: '输出数量不能代替理解质量。', adjustment: '下一轮增加一次同伴反馈并记录反例。' });
+  experiment = (await ok(f, 'POST', `/api/growth/experiments/${experiment.id}/review`, { ...review, revision: experiment.revision })).experiment;
+  const overdue = (await ok(f, 'POST', '/api/growth/experiments', experimentBody({ title: '需要回头检查的到期实验' }))).experiment;
+  const report = (await ok(f, 'POST', '/api/organize/run', { period: 'daily' })).digest;
+  assert.equal(report.stats.experimentsReviewed, 1);
+  assert.equal(report.stats.experimentsDue, 1);
+  assert(report.markdown.includes('成长实验与策略修订'));
+  assert(report.markdown.includes(review.adjustment));
+  assert(report.markdown.includes('到期实验提醒'));
+  assert(report.markdown.includes(overdue.title));
+  assert(report.sourceIds.includes(experiment.id));
+  assert(report.sourceIds.includes(overdue.id));
+  await configureMockAi(f);
+  const aiPreview = await ok(f, 'POST', `/api/thinking/cases/${item.id}/ai/preview`, { revision: item.revision });
+  assert(aiPreview.payload.strategies.some(strategy => strategy.experimentId === experiment.id && strategy.adjustment === review.adjustment), 'New analysis can inspect prior strategies with their experiment provenance');
+  let preview = await ok(f, 'POST', '/api/obsidian/preview', {});
+  for (const section of ['Growth', 'Thinking', 'Experiments']) assert(preview.files.some(file => file.path.startsWith(`PersonalCourt/${section}/`)));
+  assert(preview.files.every(file => /^PersonalCourt\/(Reading|Digests|Goals|Growth|Thinking|Experiments)\/[a-f0-9]{64}\.md$/.test(file.path)));
+  const growthFile = preview.files.find(file => file.path.startsWith('PersonalCourt/Growth/'));
+  assert(growthFile.content.includes(assessment.ratings[0].note));
+  const thinkingFile = preview.files.find(file => file.path.startsWith('PersonalCourt/Thinking/'));
+  assert(thinkingFile.content.includes(thinkingReflection().counterargument));
+  const experimentFile = preview.files.find(file => file.path.startsWith('PersonalCourt/Experiments/') && file.content.includes(review.adjustment));
+  assert(experimentFile && experimentFile.content.includes(evidence));
+  item = (await ok(f, 'POST', `/api/thinking/cases/${item.id}/reflect`, { ...thinkingReflection({ conclusion: '增加反馈后再决定是否保留策略。' }), revision: item.revision })).thinkingCase;
+  await rejectedUnchanged(f, 'POST', '/api/obsidian/export', { previewId: preview.previewId, approved: true }, 409);
+  preview = await ok(f, 'POST', '/api/obsidian/preview', {});
+  const exported = await ok(f, 'POST', '/api/obsidian/export', { previewId: preview.previewId, approved: true });
+  assert.equal(exported.written.length, preview.files.length);
+  assert.equal(fs.readFileSync(path.join(vault, 'README.md'), 'utf8'), rootReadme);
+  const unchanged = await ok(f, 'POST', '/api/obsidian/preview', {});
+  assert(unchanged.files.every(file => file.status === 'unchanged'));
+  const noDuplicate = await ok(f, 'POST', '/api/obsidian/export', { previewId: unchanged.previewId, approved: true });
+  assert.deepEqual(noDuplicate.written, []);
+  const exportedThinkingPath = path.join(vault, thinkingFile.path);
+  fs.writeFileSync(exportedThinkingPath, '# Independent reflection must survive\n', 'utf8');
+  const conflictPreview = await ok(f, 'POST', '/api/obsidian/preview', {});
+  assert.equal(conflictPreview.files.find(file => file.path === thinkingFile.path).status, 'conflict');
+  const skipped = await ok(f, 'POST', '/api/obsidian/export', { previewId: conflictPreview.previewId, approved: true });
+  assert(skipped.conflicts.some(file => file.path === thinkingFile.path));
+  assert.equal(fs.readFileSync(exportedThinkingPath, 'utf8'), '# Independent reflection must survive\n');
 });
