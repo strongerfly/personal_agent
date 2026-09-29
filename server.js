@@ -4,8 +4,10 @@ const crypto = require('node:crypto');
 const http = require('node:http');
 const { createIntegrations, validateSettings } = require('./lib/integrations');
 const growth = require('./lib/growth');
+const { version } = require('./package.json');
 
 const DAY = 86400000;
+const REVIEW_CHECKS = { feasibility: '可行性', coverage: '完整性', risk: '风险与退出预案', resources: '资源与机会成本' };
 const ZONE = 8 * 3600000;
 const DEMOS = ['补齐客户方案的成本测算页', '完成数据分析练习：分组对比', '把会议纪要转成三个行动项', '整理本周视频引用与时间码', '复盘两个顺延任务的估时偏差', '清理一个重复的自动化提醒'];
 const DEPARTMENTS = [
@@ -123,6 +125,18 @@ function createApp(options = {}) {
   }
   const event = (draft, type, sourceId, detail = '') => draft.events.push({ id: id(), type, sourceId, detail: text(detail, 300), createdAt: stamp() });
   const integrations = createIntegrations({ dataDir, getStore: () => store });
+  const runningAnalyses = new Set();
+  async function withAnalysisLock(key, operation) {
+    if (runningAnalyses.has(key)) throw fail('这项分析正在运行，请等待结束后再预览重试', 409);
+    runningAnalyses.add(key);
+    try { return await operation(); }
+    finally { runningAnalyses.delete(key); }
+  }
+  function taskAvailable(task) {
+    if (!task.proposalId) return true;
+    return store.proposals.some(proposal => proposal.id === task.proposalId && proposal.status === 'executing');
+  }
+  const activeTask = task => !done(task) && taskAvailable(task);
   const lookup = (draft, list, itemId) => {
     const item = draft[list].find(entry => String(entry.id) === String(itemId));
     if (!item) throw fail('记录不存在', 404);
@@ -143,9 +157,9 @@ function createApp(options = {}) {
   function courtOverview() {
     const realTasks = store.tasks.filter(task => !task.isDemo);
     const count = status => store.proposals.filter(proposal => proposal.status === status).length;
-    const stats = { drafts: count('draft'), review: count('review'), returned: count('returned'), approved: count('approved'), executing: count('executing'), completed: count('completed') };
+    const stats = { drafts: count('draft'), review: count('review'), returned: count('returned'), approved: count('approved'), executing: count('executing'), completed: count('completed'), paused: count('paused'), cancelled: count('cancelled') };
     const departments = DEPARTMENTS.map(meta => {
-      const assigned = realTasks.filter(task => task.dept === meta.id), active = assigned.filter(task => !done(task));
+      const assigned = realTasks.filter(task => task.dept === meta.id), active = assigned.filter(activeTask);
       return { ...meta, active: active.length, completed: assigned.filter(done).length, estimatedMinutes: active.reduce((sum, task) => sum + (Number(task.minutes) || 0), 0), overdue: active.filter(task => task.dueAt && Date.parse(task.dueAt) < +now()).length, goalCount: new Set(assigned.map(task => task.goalId).filter(Boolean)).size };
     });
     return {
@@ -180,8 +194,26 @@ function createApp(options = {}) {
   }
   function courtHistory(draft, proposal, stage, action, note = '') {
     proposal.updatedAt = stamp();
-    proposal.history.push({ id: id(), stage, action, note: text(note, 4000), revision: proposal.revision, createdAt: stamp() });
+    const entry = { id: id(), stage, action, note: text(note, 4000), revision: proposal.revision, createdAt: stamp() };
+    proposal.history.push(entry);
     event(draft, `court.${action}`, proposal.id, stage);
+    return entry;
+  }
+  function checkedItems(input, expected, keyName) {
+    if (!Array.isArray(input) || input.length !== expected.length) throw fail('请逐项核对全部检查项，不可遗漏或重复');
+    const seen = new Set();
+    return input.map(check => {
+      if (!check || typeof check !== 'object' || Array.isArray(check) || !expected.includes(check[keyName]) || seen.has(check[keyName])) throw fail('检查项无效、重复或不属于本次审核');
+      seen.add(check[keyName]);
+      if (check.passed !== true) throw fail('仍有未通过或未核对的检查项，请处理问题后再批准');
+      if (typeof check.reason !== 'string' || check.reason.length > 2000) throw fail('核对依据需为不超过2000字的文本');
+      return { [keyName]: check[keyName], passed: true, reason: required(check.reason, '具体核对依据', 2000) };
+    });
+  }
+  function hasReviewGate(proposal) {
+    if (proposal.review?.gateVersion !== 1 || proposal.review.decision !== 'approve' || !text(proposal.review.note)) return false;
+    try { checkedItems(proposal.review.checks, Object.keys(REVIEW_CHECKS), 'key'); return true; }
+    catch { return false; }
   }
   function assertRevision(record, revision) {
     if (!Number.isInteger(revision) || revision < 1) throw fail('请提供有效的记录版本 revision');
@@ -243,7 +275,7 @@ function createApp(options = {}) {
     const energy = [...store.checkins].reverse().find(checkin => dayKey(checkin.createdAt) === dayKey(now()))?.energy || 3;
     const activeGoals = new Set(store.goals.filter(goal => goal.status === 'active').map(goal => goal.id));
     const score = task => (task.dueAt && Date.parse(task.dueAt) < +now() + DAY ? 5 : 0) + (activeGoals.has(task.goalId) ? 4 : 0) + ({ 高: 3, 中: 2, 低: 1 }[task.priority] || 1) + (energy <= 2 && (task.minutes || 25) <= 25 ? 2 : 0);
-    const tasks = store.tasks.filter(task => !task.isDemo && !done(task)).sort((a, b) => score(b) - score(a) || String(a.createdAt).localeCompare(String(b.createdAt))).slice(0, 3);
+    const tasks = store.tasks.filter(task => !task.isDemo && activeTask(task) && task.status !== '已顺延').sort((a, b) => score(b) - score(a) || String(a.createdAt).localeCompare(String(b.createdAt))).slice(0, 3);
     return { tasks, energy, reason: energy <= 2 ? '优先临近截止与目标相关的行动，低精力时倾向短任务。' : '按截止时间、目标关联和优先级排序，每次聚焦最多三件事。' };
   }
   function overview() {
@@ -257,7 +289,7 @@ function createApp(options = {}) {
     const activeDays = new Set([...tasks.filter(done).map(task => task.completedAt).filter(Boolean), ...store.checkins.map(item => item.createdAt)].map(dayKey));
     let cursor = activeDays.has(dayKey(start)) ? start : start - DAY;
     while (activeDays.has(dayKey(cursor)) && streak < 36500) { streak++; cursor -= DAY; }
-    return { activeTasks: tasks.filter(task => !done(task)).length, completedToday: days[6].completed, activeGoals: store.goals.filter(goal => goal.status === 'active').length, readingCount: store.reading.length, dueReviews: store.reading.filter(item => !item.nextReviewAt || Date.parse(item.nextReviewAt) <= +now()).length, completionRate: tasks.length ? Math.round(tasks.filter(done).length / tasks.length * 100) : null, streak, days, todayTasks: morning().tasks };
+    return { activeTasks: tasks.filter(activeTask).length, completedToday: days[6].completed, activeGoals: store.goals.filter(goal => goal.status === 'active').length, readingCount: store.reading.length, dueReviews: store.reading.filter(item => !item.nextReviewAt || Date.parse(item.nextReviewAt) <= +now()).length, completionRate: tasks.length ? Math.round(tasks.filter(done).length / tasks.length * 100) : null, streak, days, todayTasks: morning().tasks };
   }
   function digest(period, at = now()) {
     if (!['daily', 'weekly'].includes(period)) throw fail('整理周期应为 daily 或 weekly');
@@ -361,7 +393,7 @@ function createApp(options = {}) {
       if (req.headers['sec-fetch-site'] === 'cross-site') throw fail('不允许跨站写入', 403);
     }
     const body = write ? await readBody(req) : {};
-    if (method === 'GET' && route === '/api/health') return { ok: true, version: '0.4.0', schemaVersion: 5, timezone: 'Asia/Shanghai' };
+    if (method === 'GET' && route === '/api/health') return { ok: true, version, schemaVersion: store.schemaVersion, timezone: 'Asia/Shanghai' };
     if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), court: courtOverview(), growth: growthState(), integrations: integrations.status() };
     if (method === 'GET' && route === '/api/growth') return growthState();
     if (method === 'POST' && route === '/api/growth/assessments') return { assessment: mutate(draft => {
@@ -402,15 +434,17 @@ function createApp(options = {}) {
           event(draft, 'thinking.reflected', caseId); return current;
         }) };
         if (action === 'preview') return integrations.aiPreview({}, thinkingCase);
-        const analysis = await integrations.analyze(body, thinkingCase);
-        return { thinkingCase: mutate(draft => {
-          const current = lookup(draft, 'thinkingCases', caseId);
-          assertRevision(current, thinkingCase.revision);
-          if (current.analysis?.mode === 'ai') current.aiHistory.unshift({ ...current.analysis, caseRevision: current.analysis.caseRevision ?? current.revision });
-          current.analysis = { ...analysis, mode: 'ai', caseRevision: current.revision };
-          current.revision++; current.updatedAt = stamp();
-          event(draft, 'thinking.analyzed', caseId); return current;
-        }) };
+        return withAnalysisLock(`thinking:${caseId}`, async () => {
+          const analysis = await integrations.analyze(body, thinkingCase);
+          return { thinkingCase: mutate(draft => {
+            const current = lookup(draft, 'thinkingCases', caseId);
+            assertRevision(current, thinkingCase.revision);
+            if (current.analysis?.mode === 'ai') current.aiHistory.unshift({ ...current.analysis, caseRevision: current.analysis.caseRevision ?? current.revision });
+            current.analysis = { ...analysis, mode: 'ai', caseRevision: current.revision };
+            current.revision++; current.updatedAt = stamp();
+            event(draft, 'thinking.analyzed', caseId); return current;
+          }) };
+        });
       }
     }
     if (method === 'POST' && route === '/api/growth/experiments') return { experiment: mutate(draft => {
@@ -453,7 +487,7 @@ function createApp(options = {}) {
       courtHistory(draft, proposal, '中书省', 'drafted', '拟定计划草案');
       return proposal;
     }) };
-    let match = route.match(/^\/api\/court\/proposals\/([^/]+)(?:\/(submit|review|dispatch|accept))?$/);
+    let match = route.match(/^\/api\/court\/proposals\/([^/]+)(?:\/(submit|review|dispatch|accept|pause|resume|cancel))?$/);
     if (match) {
       const proposalId = match[1], action = match[2];
       if (method === 'GET' && !action) return { proposal: lookup(store, 'proposals', proposalId) };
@@ -474,20 +508,24 @@ function createApp(options = {}) {
           const proposal = lookup(draft, 'proposals', proposalId);
           assertRevision(proposal, body.revision);
           if (action === 'submit') {
-            if (!['draft', 'returned'].includes(proposal.status)) throw fail('只有草案或退回的计划可以提请审议', 409);
+            const needsReview = proposal.status === 'approved' && !proposal.taskIds.length && !hasReviewGate(proposal);
+            if (!['draft', 'returned'].includes(proposal.status) && !needsReview) throw fail('只有草案、退回或需要补审的旧计划可以提请审议', 409);
             assertPlanComplete(proposal);
             proposal.status = 'review'; proposal.revision++;
-            courtHistory(draft, proposal, '中书省', 'submitted', '提请门下省审议');
+            const entry = courtHistory(draft, proposal, '中书省', 'submitted', needsReview ? '旧版批准缺少逐项审查，显式提请补审' : '提请门下省审议');
+            if (needsReview && proposal.review) entry.previousReview = structuredClone(proposal.review);
           } else if (action === 'review') {
             if (proposal.status !== 'review') throw fail('此计划不在待审议状态', 409);
             if (!['approve', 'return'].includes(body.decision)) throw fail('请选择批准或退回');
-            const note = body.decision === 'return' ? required(body.note, '退回原因', 4000) : text(body.note, 4000) || '已核对方向、步骤、投入与验收标准';
+            const note = required(body.note, body.decision === 'return' ? '退回原因' : '审议意见', 4000);
+            const checks = body.decision === 'approve' ? checkedItems(body.checks, Object.keys(REVIEW_CHECKS), 'key') : [];
             assertPlanComplete(proposal);
             proposal.status = body.decision === 'approve' ? 'approved' : 'returned'; proposal.revision++;
-            proposal.review = { decision: body.decision, note, revision: proposal.revision, createdAt: stamp() };
-            courtHistory(draft, proposal, '门下省', body.decision === 'approve' ? 'approved' : 'returned', note);
+            proposal.review = { decision: body.decision, note, checks, gateVersion: 1, method: 'self-review', revision: proposal.revision, createdAt: stamp() };
+            courtHistory(draft, proposal, '门下省', body.decision === 'approve' ? 'approved' : 'returned', note).review = structuredClone(proposal.review);
           } else if (action === 'dispatch') {
             if (proposal.status !== 'approved') throw fail('计划需经门下省批准后才能派发', 409);
+            if (!hasReviewGate(proposal)) throw fail('旧版批准缺少四项审查，请重新送审补全后再派发', 409);
             assertPlanComplete(proposal);
             const tasks = proposal.steps.map(step => newTask(draft, { title: step.title, dept: proposal.dept, goalId: proposal.goalId, priority: proposal.priority, minutes: step.minutes }, { sourceType: 'proposal', sourceId: `${proposal.id}:${step.id}`, proposalId: proposal.id, proposalStepId: step.id, acceptance: step.acceptance }));
             proposal.taskIds = tasks.map(task => task.id);
@@ -499,9 +537,24 @@ function createApp(options = {}) {
             const tasks = proposal.taskIds.map(taskId => lookup(draft, 'tasks', taskId));
             if (!tasks.length || tasks.length !== proposal.steps.length || tasks.some(task => task.proposalId !== proposal.id || !done(task) || !text(task.evidence))) throw fail('所有派发行动都需完成并提供证据，才能验收归档', 409);
             const note = required(body.note, '验收意见', 4000);
+            const checks = checkedItems(body.checks, tasks.map(task => task.id), 'taskId');
             proposal.status = 'completed'; proposal.revision++; proposal.acceptedAt = stamp();
-            proposal.acceptance = { note, createdAt: stamp(), evidence: tasks.map(task => ({ taskId: task.id, title: task.title, acceptance: task.acceptance, evidence: task.evidence, completedAt: task.completedAt })) };
+            proposal.acceptance = { note, checks, gateVersion: 1, method: 'self-review', createdAt: stamp(), evidence: tasks.map(task => ({ taskId: task.id, title: task.title, acceptance: task.acceptance, evidence: task.evidence, completedAt: task.completedAt })) };
             courtHistory(draft, proposal, '尚书省', 'accepted', note);
+          } else if (['pause', 'resume', 'cancel'].includes(action)) {
+            if (action === 'pause' && !['approved', 'executing'].includes(proposal.status)) throw fail('只有待派发或执行中的计划可以暂停', 409);
+            if (action === 'resume' && (proposal.status !== 'paused' || !['approved', 'executing'].includes(proposal.pausedFrom))) throw fail('只有暂停的计划可以恢复至原阶段', 409);
+            if (action === 'cancel' && ['completed', 'cancelled'].includes(proposal.status)) throw fail('已验收或已取消的计划不可再次取消', 409);
+            const note = required(body.note, ({ pause: '暂停原因', resume: '恢复依据', cancel: '取消原因' })[action], 4000);
+            if (action === 'pause') {
+              proposal.pausedFrom = proposal.status; proposal.status = 'paused'; proposal.pausedAt = stamp();
+            } else if (action === 'resume') {
+              proposal.status = proposal.pausedFrom; delete proposal.pausedFrom; delete proposal.pausedAt;
+            } else {
+              proposal.status = 'cancelled'; proposal.cancelledAt = stamp(); delete proposal.pausedFrom;
+            }
+            proposal.revision++;
+            courtHistory(draft, proposal, '尚书省', ({ pause: 'paused', resume: 'resumed', cancel: 'cancelled' })[action], note);
           }
           return { proposal };
         });
@@ -519,7 +572,7 @@ function createApp(options = {}) {
       }
       if (task.proposalId) {
         const proposal = lookup(draft, 'proposals', task.proposalId);
-        if (proposal.status === 'completed') throw fail('计划已验收，行动与证据已归档，不可继续修改', 409);
+        if (proposal.status !== 'executing') throw fail('计划当前不可执行；暂停、取消或验收后，行动与证据保持只读', 409);
         if (Object.keys(body).some(field => !['status', 'evidence'].includes(field))) throw fail('派发行动的计划内容已锁定，只能更新执行状态和完成证据', 409);
       }
       if (body.title !== undefined) task.title = required(body.title, '行动标题');
@@ -627,10 +680,12 @@ function createApp(options = {}) {
     }
     if (method === 'POST' && route === '/api/ai/preview') return integrations.aiPreview(body);
     if (method === 'POST' && route === '/api/ai/run') {
-      const result = await integrations.analyze(body);
-      const analysis = { ...result, id: id(), question: text(body.question), createdAt: stamp() };
-      mutate(draft => { draft.aiAnalyses.unshift(analysis); draft.aiAnalyses = draft.aiAnalyses.slice(0, 50); event(draft, 'ai.analyzed', analysis.id); });
-      return { analysis };
+      return withAnalysisLock('general', async () => {
+        const result = await integrations.analyze(body);
+        const analysis = { ...result, id: id(), question: text(body.question), createdAt: stamp() };
+        mutate(draft => { draft.aiAnalyses.unshift(analysis); draft.aiAnalyses = draft.aiAnalyses.slice(0, 50); event(draft, 'ai.analyzed', analysis.id); });
+        return { analysis };
+      });
     }
     if (route === '/api/reset') throw fail('已停用重置接口，请使用数据导出备份', 410);
     throw fail('接口不存在', 404);
