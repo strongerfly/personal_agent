@@ -175,6 +175,10 @@ function createApp(options = {}) {
   function growthState() {
     return { ...growth.growthOverview(store, stamp()), dueExperiments: store.growthExperiments.filter(item => item.status !== 'reviewed' && Date.parse(item.reviewAt) <= +now()).map(item => ({ id: item.id, title: item.title, reviewAt: item.reviewAt, status: item.status, taskId: item.taskId })) };
   }
+  function thinkingView(record) {
+    if (!record.analysis) return record;
+    return { ...record, analysis: { ...record.analysis, quality: growth.analysisQuality(record.analysis, record) } };
+  }
   function proposalFields(draft, body, existing = null) {
     const field = (key, fallback) => body[key] === undefined ? (existing?.[key] ?? fallback) : body[key];
     const goalId = text(field('goalId', ''));
@@ -394,7 +398,7 @@ function createApp(options = {}) {
     }
     const body = write ? await readBody(req) : {};
     if (method === 'GET' && route === '/api/health') return { ok: true, version, schemaVersion: store.schemaVersion, timezone: 'Asia/Shanghai' };
-    if (method === 'GET' && route === '/api/state') return { ...store, events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), court: courtOverview(), growth: growthState(), integrations: integrations.status() };
+    if (method === 'GET' && route === '/api/state') return { ...store, thinkingCases: store.thinkingCases.map(thinkingView), events: store.events.slice(-100).reverse(), runs: store.runs.slice(-100).reverse(), overview: overview(), court: courtOverview(), growth: growthState(), integrations: integrations.status() };
     if (method === 'GET' && route === '/api/growth') return growthState();
     if (method === 'POST' && route === '/api/growth/assessments') return { assessment: mutate(draft => {
       const assessment = { id: id(), ...growth.assessmentFields(draft, body), createdAt: stamp() };
@@ -408,7 +412,7 @@ function createApp(options = {}) {
     let growthMatch = route.match(/^\/api\/thinking\/cases\/([^/]+)(?:\/(?:ai\/(preview|run)|(reflect)))?$/);
     if (growthMatch) {
       const caseId = growthMatch[1], action = growthMatch[2] || growthMatch[3];
-      if (method === 'GET' && !action) return { thinkingCase: lookup(store, 'thinkingCases', caseId) };
+      if (method === 'GET' && !action) return { thinkingCase: thinkingView(lookup(store, 'thinkingCases', caseId)) };
       if (method === 'PATCH' && !action) return { thinkingCase: mutate(draft => {
         const thinkingCase = lookup(draft, 'thinkingCases', caseId);
         assertRevision(thinkingCase, body.revision);

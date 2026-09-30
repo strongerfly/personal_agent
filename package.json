@@ -1,6 +1,6 @@
 {
   "name": "personal-court-os",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "个人朝廷 OS 本地可运行系统",
   "scripts": {
@@ -9,5 +9,7 @@
     "test": "node test/system.test.js",
     "start:supervised": "powershell -NoProfile -File scripts/run.ps1 -Supervise"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

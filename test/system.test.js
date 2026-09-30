@@ -767,6 +767,25 @@ function experimentReview(overrides = {}) {
   };
 }
 
+function strategyScope(overrides = {}) {
+  return {
+    appliesWhen: '有明确实践问题且有30分钟连续时间时。',
+    avoidWhen: '睡眠不足或正在处理紧急交付时不使用。',
+    counterEvidence: '两次有问题引导的阅读仍没有形成可复核结果。',
+    reviewAt: '2026-12-01T01:00:00.000Z',
+    ...overrides
+  };
+}
+
+function reviewedExperimentRecord(id, reviewOverrides = {}, experimentOverrides = {}) {
+  return {
+    ...experimentBody(), id, revision: 4, status: 'reviewed', taskId: `task-${id}`,
+    updatedAt: '2026-09-30T02:00:00.000Z',
+    reviews: [{ ...experimentReview(), scope: strategyScope(), createdAt: '2026-09-30T02:00:00.000Z', evidence: { taskId: `task-${id}`, title: '实验行动', evidence: '保留了三次练习结果。', completedAt: '2026-09-30T01:00:00.000Z' }, ...reviewOverrides }],
+    ...experimentOverrides
+  };
+}
+
 function aiThinkingAnswer(item, overrides = {}) {
   const sourceId = `case:${item.id}`;
   return {
@@ -847,6 +866,211 @@ test('growth rejects invalid scores, duplicate dimensions and missing evidence a
     await rejectedUnchanged(f, 'POST', '/api/growth/assessments', { context: '拒绝错误评分', ratings }, [400, 404]);
   }
   assert.equal((await ok(f, 'GET', '/api/growth')).latestAssessment, null);
+});
+
+test('assessment evidence freezes the materials used for scoring and labels legacy missing references honestly', async t => {
+  const f = await fixture(t);
+  const book = await reading(f, { note: '评价时的原始实践笔记。' });
+  const { task } = await ok(f, 'POST', '/api/tasks', { title: '原始练习结果' });
+  await ok(f, 'PATCH', `/api/tasks/${task.id}`, { status: 'done', evidence: '评价时留下的一次完成证据。' });
+  const assessment = (await ok(f, 'POST', '/api/growth/assessments', {
+    context: '按保存当时的材料评价', ratings: [
+      { dimension: 'execution', score: 3, note: '单次产出仍需重复验证。', sourceIds: [`task:${task.id}`, `reading:${book.id}`] },
+      { dimension: 'reflection', score: 2, note: '只有自述，尚未关联资料。', sourceIds: [] }
+    ]
+  })).assessment;
+  const snapshot = structuredClone(assessment.ratings[0].evidenceSnapshot);
+  assert.equal(snapshot.length, 2);
+  assert(snapshot.some(source => source.id === `reading:${book.id}` && source.detail.includes('评价时的原始实践笔记。')));
+  assert(snapshot.some(source => source.id === `task:${task.id}` && source.detail.includes('评价时留下的一次完成证据。')));
+  await reading(f, { note: '后来修订的笔记，不应改写过去评分依据。' });
+  await ok(f, 'PATCH', `/api/tasks/${task.id}`, { evidence: '后来的补充证据。' });
+  const overview = await ok(f, 'GET', '/api/growth');
+  assert.deepEqual(overview.latestAssessment.ratings[0].evidenceSnapshot, snapshot);
+  const linked = overview.assessmentEvidence.find(item => item.dimension === 'execution');
+  assert.deepEqual({ sourceCount: linked.sourceCount, availableCount: linked.availableCount, missingCount: linked.missingCount, status: linked.status, snapshotAvailable: linked.snapshotAvailable }, { sourceCount: 2, availableCount: 2, missingCount: 0, status: 'linked', snapshotAvailable: true });
+  assert.deepEqual(linked.sources, snapshot);
+  assert.equal(overview.assessmentEvidence.find(item => item.dimension === 'reflection').status, 'unlinked');
+  await f.restart();
+  assert.deepEqual((await ok(f, 'GET', '/api/growth')).assessmentEvidence, overview.assessmentEvidence);
+
+  const growth = require('../lib/growth');
+  const legacyStore = f.app.getStore();
+  delete legacyStore.growthAssessments[0].ratings[0].evidenceSnapshot;
+  legacyStore.reading = [];
+  const legacy = growth.growthOverview(legacyStore, '2026-09-30T03:00:00.000Z').assessmentEvidence.find(item => item.dimension === 'execution');
+  assert.equal(legacy.snapshotAvailable, false, 'Legacy live lookup must never claim to be an original evidence snapshot');
+  assert.equal(legacy.status, 'missing');
+  assert.equal(legacy.sourceCount, 2);
+  assert.equal(legacy.availableCount, 1);
+  assert.equal(legacy.missingCount, 1);
+  assert(legacy.sources[0].detail.includes('后来的补充证据。'));
+  const frozenStore = f.app.getStore();
+  frozenStore.tasks = []; frozenStore.reading = [];
+  assert.deepEqual(growth.growthOverview(frozenStore, '2026-09-30T03:00:00.000Z').assessmentEvidence.find(item => item.dimension === 'execution').sources, snapshot, 'Deleted live records do not erase an already captured assessment basis');
+});
+
+test('strategy scope requires complete valid boundaries and the catalog retains stopped and legacy lessons', async t => {
+  const f = await fixture(t);
+  let experiment = (await ok(f, 'POST', '/api/growth/experiments', experimentBody())).experiment;
+  const started = await ok(f, 'POST', `/api/growth/experiments/${experiment.id}/start`, { revision: experiment.revision });
+  await ok(f, 'PATCH', `/api/tasks/${started.task.id}`, { status: 'done', evidence: '保留了三次练习结果。' });
+  experiment = (await ok(f, 'GET', '/api/state')).growthExperiments.find(item => item.id === experiment.id);
+  const route = `/api/growth/experiments/${experiment.id}/review`;
+  for (const scope of [null, [], {}, strategyScope({ appliesWhen: '' }), strategyScope({ avoidWhen: '' }), strategyScope({ counterEvidence: '' }), strategyScope({ reviewAt: '' }), strategyScope({ reviewAt: '2026-02-30' }), strategyScope({ reviewAt: 'not-a-date' })]) {
+    await rejectedUnchanged(f, 'POST', route, { ...experimentReview({ scope }), revision: experiment.revision }, 400);
+  }
+  experiment = (await ok(f, 'POST', route, { ...experimentReview({ scope: strategyScope() }), revision: experiment.revision })).experiment;
+  assert.deepEqual(experiment.reviews[0].scope, strategyScope());
+  const entry = (await ok(f, 'GET', '/api/growth')).strategies.find(item => item.id === experiment.id);
+  assert.equal(entry.experimentId, experiment.id);
+  for (const key of ['title', 'dimension', 'hypothesis', 'metric', 'baseline', 'target']) assert.equal(entry[key], experiment[key]);
+  for (const key of ['outcome', 'observation', 'lesson', 'adjustment', 'decision']) assert.equal(entry[key], experiment.reviews[0][key]);
+  assert.deepEqual(entry.evidenceSnapshot, experiment.reviews[0].evidence);
+  assert.deepEqual(entry.scope, strategyScope());
+
+  const growth = require('../lib/growth');
+  const legacy = reviewedExperimentRecord('legacy');
+  delete legacy.reviews[0].scope;
+  const store = { growthExperiments: [
+    reviewedExperimentRecord('active'),
+    reviewedExperimentRecord('trial', { outcome: 'inconclusive', decision: 'adjust' }),
+    reviewedExperimentRecord('due', { scope: strategyScope({ reviewAt: '2026-09-29T01:00:00.000Z' }) }),
+    reviewedExperimentRecord('stopped', { outcome: 'refuted', decision: 'stop' }),
+    legacy
+  ] };
+  const catalog = growth.strategyCatalog(store, '2026-09-30T03:00:00.000Z');
+  assert.equal(catalog.length, 5);
+  for (const [id, status] of [['active', 'active'], ['trial', 'trial'], ['due', 'due'], ['stopped', 'stopped'], ['legacy', 'needs_scope']]) {
+    assert.equal(catalog.find(item => item.id === id).status, status, `Incorrect applicability label for ${id}`);
+  }
+  assert.equal(catalog.find(item => item.id === 'stopped').decision, 'stop', 'Stopped strategies remain visible as counterexamples, not erased or relabeled active');
+  assert.deepEqual(growth.reviewFields(experimentReview()).decision, 'keep', 'Omitted scope remains compatible with older saved workflows');
+  assert.equal(legacy.reviews[0].scope, undefined, 'Catalog construction must not fabricate missing legacy boundaries');
+});
+
+test('thinking strategy selection defaults to empty, rejects unknown and duplicate IDs, and supports explicit removal', async t => {
+  const f = await fixture(t, { start: false });
+  const experiments = Array.from({ length: 9 }, (_, index) => reviewedExperimentRecord(`strategy-${index}`));
+  fs.writeFileSync(path.join(f.directory, 'store.json'), JSON.stringify({ schemaVersion: 5, tasks: [], goals: [], growthExperiments: experiments }));
+  await f.start();
+  let item = await thinkingCase(f);
+  assert.deepEqual(item.strategyIds, []);
+  for (const strategyIds of [['unknown'], ['strategy-0', 'strategy-0'], experiments.map(value => value.id), 'strategy-0', null]) {
+    await rejectedUnchanged(f, 'POST', '/api/thinking/cases', thinkingBody({ strategyIds }), [400, 404]);
+  }
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { strategyIds: ['strategy-0', 'strategy-2'], revision: item.revision })).thinkingCase;
+  assert.deepEqual(item.strategyIds, ['strategy-0', 'strategy-2']);
+  await rejectedUnchanged(f, 'PATCH', `/api/thinking/cases/${item.id}`, { strategyIds: ['unknown'], revision: item.revision }, [400, 404]);
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { title: '只修改标题，保留明确选择', revision: item.revision })).thinkingCase;
+  assert.deepEqual(item.strategyIds, ['strategy-0', 'strategy-2']);
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { strategyIds: [], revision: item.revision })).thinkingCase;
+  assert.deepEqual(item.strategyIds, []);
+  await f.restart();
+  assert.deepEqual((await ok(f, 'GET', `/api/thinking/cases/${item.id}`)).thinkingCase.strategyIds, []);
+});
+
+test('AI sends only selected strategy snapshots and approval binds selected content without unrelated invalidations', async t => {
+  const f = await fixture(t);
+  await configureMockAi(f);
+  const item = await thinkingCase(f);
+  const data = f.app.getStore();
+  data.growthExperiments = [reviewedExperimentRecord('selected', { decision: 'stop', outcome: 'refuted' }), reviewedExperimentRecord('unselected')];
+  const { createIntegrations } = require('../lib/integrations');
+  const integration = createIntegrations({ dataDir: f.directory, getStore: () => data });
+  let calls = 0;
+  let expectedStrategies = [];
+  let duringProvider;
+  mockAi(t, async (_url, options) => {
+    calls++;
+    const payload = JSON.parse(JSON.parse(options.body).messages[1].content);
+    assert.deepEqual(payload.strategies, expectedStrategies, 'Actual model input must exactly match the approved strategy snapshots');
+    if (duringProvider) duringProvider();
+    return aiResponse(aiThinkingAnswer(item));
+  });
+  let preview = integration.aiPreview({}, item);
+  assert.deepEqual(preview.payload.strategies, []);
+  await integration.analyze({ previewId: preview.previewId, approved: true }, item);
+  assert.equal(calls, 1);
+
+  item.strategyIds = ['selected'];
+  preview = integration.aiPreview({}, item);
+  assert.equal(preview.payload.strategies.length, 1);
+  assert.equal(preview.payload.strategies[0].id, 'selected');
+  assert.equal(preview.payload.strategies[0].status, 'stopped');
+  assert.deepEqual(preview.payload.strategies[0].evidenceSnapshot, data.growthExperiments[0].reviews[0].evidence);
+  assert.deepEqual(preview.payload.strategies[0].scope, strategyScope());
+  expectedStrategies = structuredClone(preview.payload.strategies);
+  data.growthExperiments[1].reviews[0].lesson = '未选择策略发生变化，不属于批准的出站内容。';
+  const result = await integration.analyze({ previewId: preview.previewId, approved: true }, item);
+  assert.deepEqual(result.inputSnapshot.strategies, expectedStrategies);
+  assert.equal(calls, 2);
+
+  for (const update of [
+    () => { data.growthExperiments[0].reviews[0].scope.counterEvidence = '选中策略出现了新的反例。'; },
+    () => { data.growthExperiments[0].reviews[0].evidence.evidence = '原始观察依据已变化。'; },
+    () => { item.strategyIds = []; }
+  ]) {
+    preview = integration.aiPreview({}, item);
+    update();
+    await assert.rejects(integration.analyze({ previewId: preview.previewId, approved: true }, item), error => error.statusCode === 409);
+    assert.equal(calls, 2, 'Changed selected evidence or selection must be rejected before contacting the model');
+  }
+  item.strategyIds = ['selected'];
+  preview = integration.aiPreview({}, item);
+  expectedStrategies = structuredClone(preview.payload.strategies);
+  duringProvider = () => { data.growthExperiments[0].reviews[0].scope.avoidWhen = '模型运行期间更新了不适用条件。'; };
+  await assert.rejects(integration.analyze({ previewId: preview.previewId, approved: true }, item), error => error.statusCode === 409);
+  assert.equal(calls, 3, 'A response for changed strategy material is not accepted after the provider returns');
+});
+
+test('analysis quality flags unsupported and repetitive reasoning without claiming truth verification', () => {
+  const growth = require('../lib/growth');
+  const item = { ...thinkingBody(), id: 'quality-case', revision: 1, strategyIds: [] };
+  const repeated = '只要努力就一定会成功。';
+  const answer = aiThinkingAnswer(item, { unknowns: [] });
+  answer.lenses = answer.lenses.map(lens => ({ ...lens, claim: repeated, counterargument: repeated, test: repeated }));
+  const quality = growth.analysisQuality(answer, item);
+  assert.equal(quality.method, 'structural');
+  assert.equal(quality.truthVerified, false);
+  for (const code of ['no_linked_evidence', 'repeated_lens_fields', 'repeated_lens_claims', 'no_unknowns', 'case_only_citations']) {
+    assert(quality.checks.some(check => check.code === code && typeof check.message === 'string' && check.message.trim()), `Missing structural warning: ${code}`);
+  }
+  const withEvidence = { ...item, sourceIds: ['reading:external-material'] };
+  const varied = aiThinkingAnswer(withEvidence, { citations: [`case:${item.id}`, 'reading:external-material'] });
+  varied.lenses = varied.lenses.map((lens, index) => ({ ...lens, claim: `待核对的解释${index}`, counterargument: `相应的替代解释${index}`, test: `记录能区分解释的观察${index}`, sourceIds: [`case:${item.id}`, 'reading:external-material'] }));
+  const noWarnings = growth.analysisQuality(varied, withEvidence);
+  assert.deepEqual(noWarnings.checks, []);
+  assert.equal(noWarnings.truthVerified, false, 'Passing structural checks must never certify that claims or causes are true');
+});
+
+test('legacy thinking analyses expose current structural warnings without silently rewriting archived records', async t => {
+  const f = await fixture(t, { start: false });
+  const item = { ...thinkingBody(), id: 'legacy-quality', revision: 2, aiHistory: [], reflections: [], createdAt: '2026-09-29T01:00:00.000Z', updatedAt: '2026-09-29T02:00:00.000Z' };
+  const oldStrategy = { experimentId: 'legacy-auto-strategy', title: '旧版本自动携带的经验', decision: 'adjust', lesson: '旧结论仍待核对。', adjustment: '下一轮增加反例。', reviewedAt: '2026-09-28T01:00:00.000Z' };
+  item.analysis = { ...aiThinkingAnswer(item, { unknowns: [] }), mode: 'ai', caseRevision: 1, inputSnapshot: { strategies: [oldStrategy] } };
+  fs.writeFileSync(path.join(f.directory, 'store.json'), JSON.stringify({ schemaVersion: 5, tasks: [], goals: [], thinkingCases: [item] }));
+  await f.start();
+  const before = await ok(f, 'GET', '/api/export');
+  assert.equal(before.thinkingCases[0].analysis.quality, undefined);
+  const view = (await ok(f, 'GET', `/api/thinking/cases/${item.id}`)).thinkingCase;
+  assert.equal(view.analysis.quality.truthVerified, false);
+  assert(view.analysis.quality.checks.some(check => check.code === 'no_unknowns'));
+  const state = await ok(f, 'GET', '/api/state');
+  assert.deepEqual(state.thinkingCases[0].analysis.quality, view.analysis.quality);
+  assert.deepEqual(await ok(f, 'GET', '/api/export'), before, 'Viewing legacy quality hints must not fabricate a historical model output or save a mutation');
+  const preview = await ok(f, 'POST', '/api/obsidian/preview', {});
+  const file = preview.files.find(value => value.path.startsWith('PersonalCourt/Thinking/'));
+  assert(file && view.analysis.quality.checks.every(check => file.content.includes(check.message)), 'Export includes the same structural caveats shown for the legacy analysis');
+  const currentSelection = file.content.split('## 当前案例选择的策略')[1]?.split('## 当次 AI 输入中的历史策略快照')[0];
+  assert(currentSelection && currentSelection.includes('当前未选择策略'));
+  assert(!currentSelection.includes(oldStrategy.experimentId), 'Historical automatic inclusion must not be displayed as a current explicit selection');
+  const historicalInput = file.content.split('## 当次 AI 输入中的历史策略快照')[1];
+  assert(historicalInput.includes(oldStrategy.title));
+  assert(historicalInput.includes('旧版未记录状态'));
+  assert(historicalInput.includes('不代表当前选择或用户曾主动选择'));
+  assert(!file.content.includes('undefined'));
+  assert.equal((await ok(f, 'GET', '/api/export')).thinkingCases[0].strategyIds, undefined, 'Export must not invent user selection history for an old case');
 });
 
 test('thinking cases preserve facts versus assumptions and reject stale edits without changing saved analysis', async t => {
@@ -956,6 +1180,9 @@ test('thinking AI validates competing perspectives and citations, consumes appro
   assert.equal(item.analysis.mode, 'ai');
   assert.equal(item.analysis.lenses.length, 3);
   assert.deepEqual(item.analysis.citations, [`case:${item.id}`]);
+  assert.equal(item.analysis.quality.method, 'structural');
+  assert.equal(item.analysis.quality.truthVerified, false);
+  assert(item.analysis.quality.checks.some(check => check.code === 'case_only_citations'));
   await rejectedUnchanged(f, 'POST', runRoute, { revision: item.revision, previewId: preview.previewId, approved: true }, 409);
   assert.equal(calls, 1);
   const savedAi = JSON.parse(JSON.stringify(item.analysis));
@@ -1142,7 +1369,7 @@ test('growth strategy loop feeds AI disclosure, period reports and conflict-safe
   const evidence = '真实观察：三次实践都有输出，但两次未获得外部反馈。';
   await ok(f, 'PATCH', `/api/tasks/${started.task.id}`, { status: 'done', evidence });
   experiment = (await ok(f, 'GET', '/api/state')).growthExperiments.find(value => value.id === experiment.id);
-  const review = experimentReview({ outcome: 'inconclusive', decision: 'adjust', observation: evidence, lesson: '输出数量不能代替理解质量。', adjustment: '下一轮增加一次同伴反馈并记录反例。' });
+  const review = experimentReview({ outcome: 'inconclusive', decision: 'adjust', observation: evidence, lesson: '输出数量不能代替理解质量。', adjustment: '下一轮增加一次同伴反馈并记录反例。', scope: strategyScope() });
   experiment = (await ok(f, 'POST', `/api/growth/experiments/${experiment.id}/review`, { ...review, revision: experiment.revision })).experiment;
   const overdue = (await ok(f, 'POST', '/api/growth/experiments', experimentBody({ title: '需要回头检查的到期实验' }))).experiment;
   const report = (await ok(f, 'POST', '/api/organize/run', { period: 'daily' })).digest;
@@ -1155,8 +1382,12 @@ test('growth strategy loop feeds AI disclosure, period reports and conflict-safe
   assert(report.sourceIds.includes(experiment.id));
   assert(report.sourceIds.includes(overdue.id));
   await configureMockAi(f);
+  const noStrategyPreview = await ok(f, 'POST', `/api/thinking/cases/${item.id}/ai/preview`, { revision: item.revision });
+  assert.deepEqual(noStrategyPreview.payload.strategies, [], 'Prior experiences are not sent before the user explicitly selects them');
+  item = (await ok(f, 'PATCH', `/api/thinking/cases/${item.id}`, { strategyIds: [experiment.id], revision: item.revision })).thinkingCase;
   const aiPreview = await ok(f, 'POST', `/api/thinking/cases/${item.id}/ai/preview`, { revision: item.revision });
   assert(aiPreview.payload.strategies.some(strategy => strategy.experimentId === experiment.id && strategy.adjustment === review.adjustment), 'New analysis can inspect prior strategies with their experiment provenance');
+  assert.deepEqual(aiPreview.payload.strategies[0].scope, review.scope);
   let preview = await ok(f, 'POST', '/api/obsidian/preview', {});
   for (const section of ['Growth', 'Thinking', 'Experiments']) assert(preview.files.some(file => file.path.startsWith(`PersonalCourt/${section}/`)));
   assert(preview.files.every(file => /^PersonalCourt\/(Reading|Digests|Goals|Growth|Thinking|Experiments)\/[a-f0-9]{64}\.md$/.test(file.path)));
@@ -1166,6 +1397,7 @@ test('growth strategy loop feeds AI disclosure, period reports and conflict-safe
   assert(thinkingFile.content.includes(thinkingReflection().counterargument));
   const experimentFile = preview.files.find(file => file.path.startsWith('PersonalCourt/Experiments/') && file.content.includes(review.adjustment));
   assert(experimentFile && experimentFile.content.includes(evidence));
+  for (const detail of Object.values(review.scope)) assert(experimentFile.content.includes(detail), 'Export retains applicability, limits, counterevidence and review date');
   item = (await ok(f, 'POST', `/api/thinking/cases/${item.id}/reflect`, { ...thinkingReflection({ conclusion: '增加反馈后再决定是否保留策略。' }), revision: item.revision })).thinkingCase;
   await rejectedUnchanged(f, 'POST', '/api/obsidian/export', { previewId: preview.previewId, approved: true }, 409);
   preview = await ok(f, 'POST', '/api/obsidian/preview', {});
